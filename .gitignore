@@ -41,6 +41,11 @@ build/Release
 node_modules/
 jspm_packages/
 
+# Agents-Workspaces local state
+.data/
+.agentboard/
+.agents-workspaces/
+
 # Snowpack dependency directory (https://snowpack.dev/)
 web_modules/
 

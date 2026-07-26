@@ -1,0 +1,30 @@
+services:
+  codex-runner:
+    profiles: ["codex"]
+    build:
+      context: .
+      dockerfile: docker/base/Dockerfile
+    working_dir: /workspace
+    init: true
+    privileged: false
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - ${AGENTS_WORKSPACES_TASK_PATH:-.}:/workspace
+      - codex-config:/home/agent/.codex
+
+  claude-runner:
+    profiles: ["claude"]
+    build:
+      context: .
+      dockerfile: docker/base/Dockerfile
+    working_dir: /workspace
+    init: true
+    privileged: false
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - ${AGENTS_WORKSPACES_TASK_PATH:-.}:/workspace
+      - claude-config:/home/agent/.claude
+
+volumes:
+  codex-config:
+  claude-config:

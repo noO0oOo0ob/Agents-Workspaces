@@ -1,0 +1,13 @@
+{
+  "name": "@agents-workspaces/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "agents-workspaces": "src/index.ts"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts"
+  }
+}
+
