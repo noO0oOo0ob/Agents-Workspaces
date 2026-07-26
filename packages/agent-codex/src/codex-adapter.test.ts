@@ -54,7 +54,7 @@ describe("CodexAdapter", () => {
     assert.equal(handle.providerSessionId, "thread-1");
     executor.process.serverRequest({
       jsonrpc: "2.0", id: 99, method: "item/commandExecution/requestApproval",
-      params: { threadId: "thread-1", turnId: "turn-1", itemId: "item-1", command: "npm test" },
+      params: { threadId: "thread-1", turnId: "turn-1", itemId: "item-1", command: "pnpm test" },
     });
     await new Promise((resolve) => setTimeout(resolve, 10));
     const response = executor.process.writes.find((message) => message.id === 99);
@@ -62,4 +62,3 @@ describe("CodexAdapter", () => {
     assert.ok(events.some((event) => event.type === "session.started"));
   });
 });
-

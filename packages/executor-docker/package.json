@@ -5,7 +5,7 @@
   "type": "module",
   "exports": "./src/index.ts",
   "dependencies": {
-    "@agents-workspaces/executor-core": "*",
-    "@agents-workspaces/executor-native": "*"
+    "@agents-workspaces/executor-core": "workspace:*",
+    "@agents-workspaces/executor-native": "workspace:*"
   }
 }

@@ -74,6 +74,6 @@ Usage:
   agents-workspaces start    Start the local control plane and open the Web UI
 
 Development:
-  npm run dev                Start daemon and web UI
+  pnpm dev                   Start daemon and web UI
 `);
 }

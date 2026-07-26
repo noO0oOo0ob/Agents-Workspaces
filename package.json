@@ -4,26 +4,25 @@
   "private": true,
   "description": "Local multi-agent workspace orchestrator for Codex and Claude Code",
   "type": "module",
+  "packageManager": "pnpm@10.23.0",
   "engines": {
     "node": ">=22.0.0",
-    "npm": ">=10.0.0"
+    "pnpm": ">=10.0.0"
   },
-  "workspaces": [
-    "apps/*",
-    "packages/*"
-  ],
   "scripts": {
-    "dev": "concurrently -n daemon,web -c cyan,magenta \"npm run dev:daemon\" \"npm run dev:web\"",
-    "dev:daemon": "npm run dev --workspace @agents-workspaces/daemon",
-    "dev:web": "npm run dev --workspace @agents-workspaces/web",
+    "dev": "concurrently -n daemon,web -c cyan,magenta \"pnpm dev:daemon\" \"pnpm dev:web\"",
+    "dev:daemon": "pnpm --filter @agents-workspaces/daemon dev",
+    "dev:web": "pnpm --filter @agents-workspaces/web dev",
     "start": "tsx apps/cli/src/index.ts start",
-    "build": "npm run typecheck && npm run build --workspace @agents-workspaces/web",
+    "build": "pnpm typecheck && pnpm --filter @agents-workspaces/web build",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test packages/*/src/*.test.ts apps/*/src/*.test.ts",
     "test:watch": "node --import tsx --test --watch packages/*/src/*.test.ts apps/*/src/*.test.ts",
     "format:check": "prettier --check .",
     "format": "prettier --write .",
-    "doctor": "npm run dev --workspace @agents-workspaces/cli -- doctor",
+    "doctor": "pnpm --filter @agents-workspaces/cli dev doctor",
+    "login:codex": "pnpm --filter @agents-workspaces/cli dev login codex",
+    "login:claude": "pnpm --filter @agents-workspaces/cli dev login claude",
     "docker:build": "docker build -f docker/base/Dockerfile -t agents-workspaces-runner:local ."
   },
   "dependencies": {
@@ -42,5 +41,10 @@
     "tsx": "^4.19.3",
     "typescript": "^5.8.2",
     "vite": "^6.2.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
   }
 }

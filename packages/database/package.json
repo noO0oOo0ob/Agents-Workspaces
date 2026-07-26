@@ -5,6 +5,6 @@
   "type": "module",
   "exports": "./src/index.ts",
   "dependencies": {
-    "@agents-workspaces/core": "*"
+    "@agents-workspaces/core": "workspace:*"
   }
 }

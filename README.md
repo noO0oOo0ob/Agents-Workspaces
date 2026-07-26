@@ -22,7 +22,7 @@ P0 已实现，当前仓库包含：
 
 - macOS
 - Node.js 22 或更高版本
-- npm 10 或更高版本
+- pnpm 10 或更高版本
 - Git
 - Docker Desktop（使用 Docker Executor 时）
 - Codex CLI（使用 Codex 时）
@@ -31,29 +31,29 @@ P0 已实现，当前仓库包含：
 ## 开始开发
 
 ```bash
-npm install
-npm run build
-npm start
+pnpm install
+pnpm build
+pnpm start
 ```
 
 首次使用 Docker Executor 前构建本地 Runner 镜像：
 
 ```bash
-npm run docker:build
+pnpm docker:build
 ```
 
 然后分别在持久凭证卷中登录（每个 Provider 只需执行一次）：
 
 ```bash
-npm run dev --workspace @agents-workspaces/cli -- login codex
-npm run dev --workspace @agents-workspaces/cli -- login claude
+pnpm login:codex
+pnpm login:claude
 ```
 
 开发时也可以分别启动：
 
 ```bash
-npm run dev:daemon
-npm run dev:web
+pnpm dev:daemon
+pnpm dev:web
 ```
 
 服务默认对用户界面只允许本机访问；进程监听所有本机接口，是为了让 Docker Desktop 中的 Claude Code 能通过 `host.docker.internal` 回调。非 Hook 请求会按来源地址拒绝，Hook 使用每次启动生成的 Bearer Token。
@@ -61,9 +61,9 @@ npm run dev:web
 常用检查：
 
 ```bash
-npm run typecheck
-npm run test
-npm run build
+pnpm typecheck
+pnpm test
+pnpm build
 ```
 
 ## 仓库结构
