@@ -1,3 +1,5 @@
+import type { BaseEvent } from "@ag-ui/core";
+
 export type AgentProvider = "codex" | "claude";
 export type ExecutorType = "native" | "docker";
 export type TaskStatus =
@@ -8,7 +10,9 @@ export type TaskStatus =
   | "done"
   | "cancelled";
 export type WorkspaceStatus = "creating" | "ready" | "failed" | "archived";
-export type SessionRuntimeStatus = "starting" | "running" | "waiting" | "stopped" | "failed";
+export type SessionRuntimeStatus = "starting" | "running" | "waiting" | "suspended" | "stopped" | "failed";
+export type SessionAttemptStatus = "starting" | "running" | "waiting" | "idle" | "completed" | "failed" | "interrupted" | "stopped";
+export type ConversationMessageStatus = "queued" | "submitting" | "accepted" | "failed";
 export type InteractionStatus = "pending" | "responded" | "resolved" | "stale" | "cancelled";
 export type InteractionKind =
   | "command_approval"
@@ -24,6 +28,37 @@ export interface Project {
   description: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface WorkspaceHub {
+  id: string;
+  legacyProjectId: string;
+  name: string;
+  rootPath: string;
+  branchPrefix: string;
+  status: "ready" | "archived";
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ManagedProject {
+  id: string;
+  name: string;
+  localPath: string;
+  remoteUrl: string;
+  baseBranch: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WorkspaceHubProject {
+  id: string;
+  workspaceId: string;
+  projectId: string;
+  branch: string;
+  worktreePath: string;
+  baseBranch: string;
+  createdAt: string;
 }
 
 export interface Repository {
@@ -101,6 +136,32 @@ export interface AgentSession {
   endedAt: string | null;
 }
 
+export interface SessionAttempt {
+  id: string;
+  sessionId: string;
+  status: SessionAttemptStatus;
+  resumed: boolean;
+  providerSessionId: string | null;
+  error: string | null;
+  startedAt: string;
+  updatedAt: string;
+  endedAt: string | null;
+}
+
+export interface ConversationMessage {
+  id: string;
+  clientMessageId: string;
+  taskId: string;
+  sessionId: string;
+  role: "user";
+  content: string;
+  status: ConversationMessageStatus;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+  acceptedAt: string | null;
+}
+
 export interface InteractionOption {
   label: string;
   value: string;
@@ -137,6 +198,13 @@ export interface AgentEvent<TPayload = unknown> {
   payload: TPayload;
 }
 
+export type AgUiEvent = BaseEvent;
+export type AgentStreamEvent = AgentEvent<AgUiEvent>;
+
+export function isAgUiEvent(value: unknown): value is AgUiEvent {
+  return Boolean(value && typeof value === "object" && typeof (value as { type?: unknown }).type === "string");
+}
+
 export type DomainEvent<TPayload = unknown> = AgentEvent<TPayload>;
 
 export interface RepositoryChanges {
@@ -162,6 +230,12 @@ export function deriveTaskStatus(task: TaskStatusFacts): TaskStatus {
   if (task.cancelledAt) return "cancelled";
   if (task.completedAt) return "done";
   if (task.interactions.some((interaction) => interaction.status === "pending")) {
+    return "needs_attention";
+  }
+  if (task.sessions.some((session) => session.runtimeStatus === "failed")) {
+    return "needs_attention";
+  }
+  if (task.sessions.some((session) => session.runtimeStatus === "suspended")) {
     return "needs_attention";
   }
   if (task.sessions.some((session) =>

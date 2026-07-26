@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/index.ts"
+    "dev": "tsx watch --exclude '../../../ag-ui/**' src/index.ts"
   },
   "dependencies": {
     "@agents-workspaces/agent-claude": "workspace:*",

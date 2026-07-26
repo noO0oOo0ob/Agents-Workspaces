@@ -13,10 +13,16 @@ const repositoryInput = z.object({
   localPath: z.string().trim().min(1).nullable().optional(),
   remoteUrl: z.string().trim().nullable().default(null),
   baseBranch: z.string().trim().min(1).default("main"),
+}).refine((value) => Boolean(value.localPath) !== Boolean(value.remoteUrl), {
+  message: "Choose exactly one repository source: remote URL or local path",
 });
+const workspaceRepositoryInput = z.discriminatedUnion("sourceType", [
+  z.object({ sourceType: z.literal("remote"), remoteUrl: z.string().trim().min(1) }),
+  z.object({ sourceType: z.literal("local"), localPath: z.string().trim().min(1) }),
+]);
 const taskInput = z.object({ projectId: z.string().min(1), title: z.string().trim().min(1).max(200), description: z.string().trim().default("") });
 const workspaceInput = z.object({
-  repositoryIds: z.array(z.string().min(1)).min(1), rootPath: z.string().optional(),
+  repositoryIds: z.array(z.string().min(1)).default([]), rootPath: z.string().optional(),
   branchName: z.string().optional(), fetch: z.boolean().default(false),
   knowledgeSources: z.array(z.object({ path: z.string(), scope: z.enum(["global", "project", "repository", "task"]), title: z.string().optional() })).default([]),
 });
@@ -27,6 +33,21 @@ const sessionInput = z.object({
 const profileInput = z.object({
   name: z.string().trim().min(1), type: z.enum(["native", "docker"]), provider: z.enum(["codex", "claude"]),
   image: z.string().nullable().default(null), environment: z.record(z.string()).default({}),
+});
+const workspaceHubInput = z.object({
+  name: z.string().trim().min(1).max(120),
+  rootPath: z.string().trim().min(1).optional(),
+  branchName: z.string().trim().min(1).optional(),
+});
+const workspaceProjectInput = z.discriminatedUnion("sourceType", [
+  z.object({ sourceType: z.literal("existing"), projectId: z.string().min(1) }),
+  z.object({ sourceType: z.literal("remote"), remoteUrl: z.string().trim().min(1) }),
+  z.object({ sourceType: z.literal("local"), localPath: z.string().trim().min(1) }),
+]);
+const agentTaskInput = z.object({
+  title: z.string().trim().min(1).max(200), provider: z.enum(["codex", "claude"]),
+  executorType: z.enum(["native", "docker"]), prompt: z.string().trim().min(1),
+  executionProfileId: z.string().optional(), startImmediately: z.boolean().default(true),
 });
 
 function parsed<T>(schema: z.ZodType<T>, value: unknown): T {
@@ -75,6 +96,31 @@ export async function createApp(runtime = new AgentBoardRuntime()): Promise<Fast
 
   app.get("/api/health", async () => runtime.health());
 
+  app.get("/api/workspaces", async () => ({ items: runtime.listWorkspaceHubDetails() }));
+  app.post("/api/workspaces", async (request, reply) => {
+    const input = parsed(workspaceHubInput, request.body);
+    return reply.code(201).send(await runtime.createWorkspaceHub({
+      name: input.name,
+      ...(input.rootPath ? { rootPath: input.rootPath } : {}),
+      ...(input.branchName ? { branchName: input.branchName } : {}),
+    }));
+  });
+  app.get("/api/workspaces/:id", async (request) => runtime.workspaceHubDetails(parsed(idParams, request.params).id));
+  app.post("/api/workspaces/:id/projects", async (request, reply) => {
+    const { id } = parsed(idParams, request.params);
+    return reply.code(201).send(await runtime.addProjectToWorkspaceHub(id, parsed(workspaceProjectInput, request.body)));
+  });
+  app.post("/api/workspaces/:id/tasks", async (request, reply) => {
+    const { id } = parsed(idParams, request.params);
+    const input = parsed(agentTaskInput, request.body);
+    return reply.code(201).send(await runtime.createAgentTask(id, {
+      title: input.title, provider: input.provider, executorType: input.executorType,
+      prompt: input.prompt, startImmediately: input.startImmediately ?? true,
+      ...(input.executionProfileId ? { executionProfileId: input.executionProfileId } : {}),
+    }));
+  });
+  app.get("/api/project-registry", async () => ({ items: runtime.db.listManagedProjects() }));
+
   app.get("/api/projects", async () => ({ items: runtime.db.listProjects() }));
   app.post("/api/projects", async (request, reply) => {
     const input = parsed(projectInput, request.body);
@@ -101,10 +147,18 @@ export async function createApp(runtime = new AgentBoardRuntime()): Promise<Fast
     return reply.code(201).send(runtime.createTask({ projectId: input.projectId, title: input.title, description: input.description ?? "" }));
   });
   app.get("/api/tasks/:id", async (request) => runtime.taskDetails(parsed(idParams, request.params).id));
+  app.post("/api/tasks/:id/messages", async (request, reply) => {
+    const { id } = parsed(idParams, request.params);
+    const { message, clientMessageId } = parsed(z.object({ message: z.string().trim().min(1), clientMessageId: z.string().min(1).optional() }), request.body);
+    const session = runtime.db.listSessions(id).at(-1);
+    if (!session) return reply.code(400).send({ error: "invalid_request", message: "Task has no Agent session" });
+    const persisted = await runtime.sendMessage(session.id, message, clientMessageId);
+    return reply.code(202).send({ accepted: true, message: persisted });
+  });
   app.post("/api/tasks/:id/workspace", async (request, reply) => {
     const { id } = parsed(idParams, request.params);
     const input = parsed(workspaceInput, request.body);
-    return reply.code(201).send(await runtime.createTaskWorkspace(id, input.repositoryIds, {
+    return reply.code(201).send(await runtime.createTaskWorkspace(id, input.repositoryIds ?? [], {
       ...(input.rootPath ? { rootPath: input.rootPath } : {}),
       ...(input.branchName ? { branchName: input.branchName } : {}),
       fetch: input.fetch ?? false,
@@ -112,6 +166,11 @@ export async function createApp(runtime = new AgentBoardRuntime()): Promise<Fast
         path: source.path, scope: source.scope, ...(source.title ? { title: source.title } : {}),
       })),
     }));
+  });
+  app.post("/api/tasks/:id/workspace/repositories", async (request, reply) => {
+    const { id } = parsed(idParams, request.params);
+    const input = parsed(workspaceRepositoryInput, request.body);
+    return reply.code(201).send(await runtime.addRepositoryToWorkspace(id, input));
   });
   app.get("/api/tasks/:id/changes", async (request) => ({ items: await runtime.taskChanges(parsed(idParams, request.params).id) }));
   app.post("/api/tasks/:id/workspace/cleanup", async (request) => {
@@ -137,9 +196,9 @@ export async function createApp(runtime = new AgentBoardRuntime()): Promise<Fast
 
   app.post("/api/sessions/:id/messages", async (request, reply) => {
     const { id } = parsed(idParams, request.params);
-    const { message } = parsed(z.object({ message: z.string().trim().min(1) }), request.body);
-    await runtime.sendMessage(id, message);
-    return reply.code(202).send({ accepted: true });
+    const { message, clientMessageId } = parsed(z.object({ message: z.string().trim().min(1), clientMessageId: z.string().min(1).optional() }), request.body);
+    const persisted = await runtime.sendMessage(id, message, clientMessageId);
+    return reply.code(202).send({ accepted: true, message: persisted });
   });
   app.post("/api/sessions/:id/interrupt", async (request) => { await runtime.interruptSession(parsed(idParams, request.params).id); return { ok: true }; });
   app.post("/api/sessions/:id/terminate", async (request) => { await runtime.terminateSession(parsed(idParams, request.params).id); return { ok: true }; });
@@ -189,7 +248,9 @@ export async function createApp(runtime = new AgentBoardRuntime()): Promise<Fast
     const url = new URL(request.url, "http://localhost");
     const taskId = url.searchParams.get("taskId");
     const after = Number(url.searchParams.get("after") ?? 0);
-    socket.send(JSON.stringify({ type: "snapshot", events: runtime.db.listEvents(taskId ?? undefined, after) }));
+    if (url.searchParams.get("snapshot") !== "0") {
+      socket.send(JSON.stringify({ type: "snapshot", events: runtime.db.listEvents(taskId ?? undefined, after) }));
+    }
     const unsubscribe = runtime.subscribe((event) => {
       if (!taskId || event.taskId === taskId) socket.send(JSON.stringify({ type: "event", event }));
     });

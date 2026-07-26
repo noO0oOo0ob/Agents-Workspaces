@@ -37,6 +37,7 @@ export interface AgentAdapterHooks {
 
 export interface AgentAdapter {
   readonly provider: AgentProvider;
+  isRunning(sessionId: string): boolean;
   checkInstallation(): Promise<{ installed: boolean; version?: string; error?: string }>;
   start(input: StartAgentInput): Promise<AgentSessionHandle>;
   sendMessage(sessionId: string, message: string): Promise<void>;

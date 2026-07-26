@@ -49,7 +49,14 @@ describe("ClaudeAdapter", () => {
     const settings = readFileSync(join(workspacePath, ".agents-workspaces", "claude-settings.json"), "utf8");
     assert.match(settings, /Bearer \$AGENTS_WORKSPACES_HOOK_TOKEN/);
     assert.match(executor.process.writes[0] ?? "", /Implement/);
+    executor.process.events.emit("output", "stdout", `${JSON.stringify({ type: "system", session_id: "claude-session-1" })}\n`);
+    executor.process.events.emit("output", "stdout", `${JSON.stringify({
+      type: "stream_event",
+      event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "Hello" } },
+    })}\n`);
     executor.process.events.emit("output", "stdout", `${JSON.stringify({ type: "result", is_error: false, result: "done" })}\n`);
-    assert.ok(events.some((event) => event.type === "turn.completed"));
+    assert.ok(events.some((event) => event.type === "RUN_STARTED"));
+    assert.ok(events.some((event) => event.type === "TEXT_MESSAGE_CONTENT" && (event.payload as { delta?: string }).delta === "Hello"));
+    assert.ok(events.some((event) => event.type === "RUN_FINISHED"));
   });
 });

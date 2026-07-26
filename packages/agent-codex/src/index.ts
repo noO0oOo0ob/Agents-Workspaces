@@ -7,16 +7,14 @@ import type {
   StartAgentInput,
 } from "@agents-workspaces/agent-core";
 import type { ProcessHandle } from "@agents-workspaces/executor-core";
+import {
+  CodexAppServerEventAdapter,
+  codexInteractionEvent,
+  parseCodexInteractionRequest,
+  type CodexJsonRpcMessage,
+} from "@agents-workspaces/ag-ui-codex-app-server";
 
 const execFileAsync = promisify(execFile);
-
-interface JsonRpcMessage {
-  id?: string | number;
-  method?: string;
-  params?: Record<string, unknown>;
-  result?: unknown;
-  error?: { code?: number; message?: string; data?: unknown };
-}
 
 interface CodexRuntime {
   input: StartAgentInput;
@@ -26,6 +24,7 @@ interface CodexRuntime {
   sequence: number;
   pending: Map<string | number, { resolve(value: unknown): void; reject(error: Error): void }>;
   stdoutBuffer: string;
+  events: CodexAppServerEventAdapter;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -38,6 +37,8 @@ export class CodexAdapter implements AgentAdapter {
   readonly #sessions = new Map<string, CodexRuntime>();
 
   constructor(hooks: AgentAdapterHooks) { this.#hooks = hooks; }
+
+  isRunning(sessionId: string): boolean { return this.#sessions.has(sessionId); }
 
   async checkInstallation(): Promise<{ installed: boolean; version?: string; error?: string }> {
     try {
@@ -66,6 +67,10 @@ export class CodexAdapter implements AgentAdapter {
       sequence: 0,
       pending: new Map(),
       stdoutBuffer: "",
+      events: new CodexAppServerEventAdapter({
+        threadId: input.providerSessionId ?? input.sessionId,
+        runId: input.sessionId,
+      }),
     };
     this.#sessions.set(input.sessionId, runtime);
     process.onOutput((stream, data) => {
@@ -96,6 +101,7 @@ export class CodexAdapter implements AgentAdapter {
       : { cwd: input.workspacePath, approvalPolicy: "on-request", approvalsReviewer: "user", sandbox: "workspace-write", ephemeral: false }));
     const thread = asRecord(threadResult.thread);
     runtime.threadId = String(thread.id ?? input.providerSessionId ?? "");
+    runtime.events.setContext({ threadId: runtime.threadId });
     this.#emit(runtime, "session.started", { providerSessionId: runtime.threadId });
     await this.#startTurn(runtime, input.prompt);
     return { sessionId: input.sessionId, providerSessionId: runtime.threadId, provider: "codex" };
@@ -135,6 +141,7 @@ export class CodexAdapter implements AgentAdapter {
     }));
     const turn = asRecord(result.turn);
     runtime.turnId = typeof turn.id === "string" ? turn.id : runtime.turnId;
+    if (runtime.turnId) runtime.events.setContext({ runId: runtime.turnId });
   }
 
   #request(runtime: CodexRuntime, method: string, params: Record<string, unknown>): Promise<unknown> {
@@ -155,7 +162,7 @@ export class CodexAdapter implements AgentAdapter {
       runtime.stdoutBuffer = runtime.stdoutBuffer.slice(newline + 1);
       if (line) {
         try {
-          const message = JSON.parse(line) as JsonRpcMessage;
+          const message = JSON.parse(line) as CodexJsonRpcMessage;
           void this.#handle(runtime, message).catch((error) => {
             this.#emit(runtime, "session.error", { message: error instanceof Error ? error.message : String(error) });
             if (message.id !== undefined && message.method) {
@@ -169,7 +176,7 @@ export class CodexAdapter implements AgentAdapter {
     }
   }
 
-  async #handle(runtime: CodexRuntime, message: JsonRpcMessage): Promise<void> {
+  async #handle(runtime: CodexRuntime, message: CodexJsonRpcMessage): Promise<void> {
     if (message.id !== undefined && !message.method) {
       const pending = runtime.pending.get(message.id);
       if (!pending) return;
@@ -185,60 +192,29 @@ export class CodexAdapter implements AgentAdapter {
       return;
     }
     const params = message.params ?? {};
-    if (message.method === "turn/started") runtime.turnId = String(asRecord(params.turn).id ?? runtime.turnId ?? "");
-    if (message.method === "turn/completed") {
-      runtime.turnId = null;
-      this.#emit(runtime, "turn.completed", params);
-    } else if (message.method === "item/agentMessage/delta") {
-      this.#emit(runtime, "message.delta", params);
-    } else if (message.method === "item/started") {
-      this.#emit(runtime, "tool.started", params);
-    } else if (message.method === "item/completed") {
-      this.#emit(runtime, "tool.completed", params);
-    } else if (message.method === "error") {
-      this.#emit(runtime, "session.error", params);
-    } else {
-      this.#emit(runtime, "provider.event", { method: message.method, params });
+    if (message.method === "turn/started") {
+      runtime.turnId = String(asRecord(params.turn).id ?? runtime.turnId ?? "");
+      runtime.events.setContext({ runId: runtime.turnId });
     }
+    const adapted = runtime.events.adapt(message);
+    for (const event of adapted.events) this.#emit(runtime, event.type, event);
+    if (message.method === "turn/completed" || message.method === "error") runtime.turnId = null;
   }
 
-  async #handleServerRequest(runtime: CodexRuntime, message: JsonRpcMessage): Promise<Record<string, unknown>> {
-    const params = message.params ?? {};
-    const providerRequestId = String(message.id);
-    if (message.method === "item/commandExecution/requestApproval") {
+  async #handleServerRequest(runtime: CodexRuntime, message: CodexJsonRpcMessage): Promise<Record<string, unknown>> {
+    const interaction = parseCodexInteractionRequest(message);
+    if (interaction) {
+      const reason = interaction.request.reason;
+      const interactionEvent = codexInteractionEvent(interaction);
+      this.#emit(runtime, interactionEvent.type, interactionEvent);
       return this.#hooks.requestInteraction(runtime.input.sessionId, {
-        providerRequestId, kind: "command_approval", title: "Approve command",
-        message: typeof params.reason === "string" ? params.reason : undefined,
-        riskLevel: "high", request: params,
-        availableDecisions: Array.isArray(params.availableDecisions) ? params.availableDecisions.filter((x): x is string => typeof x === "string") : ["accept", "acceptForSession", "decline", "cancel"],
-      });
-    }
-    if (message.method === "item/fileChange/requestApproval") {
-      return this.#hooks.requestInteraction(runtime.input.sessionId, {
-        providerRequestId, kind: "file_approval", title: "Approve file changes",
-        message: typeof params.reason === "string" ? params.reason : undefined,
-        riskLevel: "medium", request: params,
-        availableDecisions: ["accept", "acceptForSession", "decline", "cancel"],
-      });
-    }
-    if (message.method === "item/permissions/requestApproval") {
-      return this.#hooks.requestInteraction(runtime.input.sessionId, {
-        providerRequestId, kind: "permission_request", title: "Grant additional permissions",
-        message: typeof params.reason === "string" ? params.reason : undefined,
-        riskLevel: "high", request: params, availableDecisions: ["accept", "decline"],
-      });
-    }
-    if (message.method === "item/tool/requestUserInput") {
-      return this.#hooks.requestInteraction(runtime.input.sessionId, {
-        providerRequestId, kind: "question", title: "Agent needs your input",
-        riskLevel: "low", request: params, availableDecisions: ["submit", "cancel"],
-      });
-    }
-    if (message.method === "mcpServer/elicitation/request") {
-      return this.#hooks.requestInteraction(runtime.input.sessionId, {
-        providerRequestId, kind: "form", title: "Agent requested structured input",
-        message: typeof params.message === "string" ? params.message : undefined,
-        riskLevel: "low", request: params, availableDecisions: ["accept", "decline", "cancel"],
+        providerRequestId: String(interaction.requestId),
+        kind: interaction.kind === "dynamic_tool_call" ? "form" : interaction.kind,
+        title: interaction.title,
+        ...(typeof reason === "string" ? { message: reason } : {}),
+        riskLevel: interaction.riskLevel,
+        request: interaction.request,
+        availableDecisions: interaction.availableDecisions,
       });
     }
     return {};

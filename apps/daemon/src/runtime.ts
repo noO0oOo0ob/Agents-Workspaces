@@ -5,7 +5,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { ClaudeAdapter } from "@agents-workspaces/agent-claude";
+import { ClaudeAdapter, claudeCodeInteractionEvent, parseClaudeCodeHook } from "@agents-workspaces/agent-claude";
 import type { AdapterInteractionInput, AgentAdapter } from "@agents-workspaces/agent-core";
 import { CodexAdapter } from "@agents-workspaces/agent-codex";
 import {
@@ -15,6 +15,7 @@ import {
   type AgentEvent,
   type AgentProvider,
   type AgentSession,
+  type ConversationMessage,
   type ExecutionProfile,
   type InteractionRequest,
   type Project,
@@ -22,12 +23,28 @@ import {
   type Task,
   type Workspace,
   type WorkspaceRepository,
+  type WorkspaceHub,
+  type ManagedProject,
+  type WorkspaceHubProject,
+  type SessionAttempt,
 } from "@agents-workspaces/core";
 import { AppDatabase, createDatabaseConfig } from "@agents-workspaces/database";
 import { DockerExecutor } from "@agents-workspaces/executor-docker";
 import { NativeExecutor } from "@agents-workspaces/executor-native";
 import { writeCompiledContexts, type KnowledgeSourceInput } from "@agents-workspaces/knowledge-compiler";
-import { createWorkspace, inspectChanges, removeWorkspaceWorktrees, resolveWorkspacePath, safeDirectoryName, validateGitRepository } from "@agents-workspaces/workspace-manager";
+import {
+  addWorkspaceWorktree,
+  cloneManagedRepository,
+  createWorkspace,
+  gitDefaultBranch,
+  gitRemoteUrl,
+  inspectChanges,
+  removeWorkspaceWorktrees,
+  repositoryNameFromSource,
+  resolveWorkspacePath,
+  safeDirectoryName,
+  validateGitRepository,
+} from "@agents-workspaces/workspace-manager";
 
 const execFileAsync = promisify(execFile);
 
@@ -65,26 +82,37 @@ interface PendingInteraction {
   reject(error: Error): void;
 }
 
+function badRequest(message: string): Error & { statusCode: number } {
+  return Object.assign(new Error(message), { statusCode: 400 });
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export class AgentBoardRuntime {
   readonly db: AppDatabase;
   readonly config: RuntimeConfig;
   readonly #events = new EventEmitter();
   readonly #pendingInteractions = new Map<string, PendingInteraction>();
+  readonly #sessionMessageQueues = new Map<string, Promise<void>>();
   readonly #native = new NativeExecutor();
   readonly #docker = new DockerExecutor();
   readonly #adapters: Record<AgentProvider, AgentAdapter>;
 
-  constructor(config = loadRuntimeConfig()) {
+  constructor(config = loadRuntimeConfig(), adapters: Partial<Record<AgentProvider, AgentAdapter>> = {}) {
     this.config = config;
     this.db = new AppDatabase(createDatabaseConfig(config.dataDirectory).filePath);
     const hooks = {
       emit: (event: Omit<AgentEvent, "id" | "occurredAt" | "schemaVersion">) => this.emit(event),
       requestInteraction: (sessionId: string, input: AdapterInteractionInput) => this.requestInteraction(sessionId, input),
     };
-    this.#adapters = { codex: new CodexAdapter(hooks), claude: new ClaudeAdapter(hooks) };
-    for (const session of this.db.recoverInterruptedSessions(now())) {
-      this.db.setTaskStatus(session.taskId, "in_review", now());
-    }
+    this.#adapters = {
+      codex: adapters.codex ?? new CodexAdapter(hooks),
+      claude: adapters.claude ?? new ClaudeAdapter(hooks),
+    };
+    for (const session of this.db.recoverInterruptedSessions(now())) this.db.setTaskStatus(session.taskId, "needs_attention", now());
+    this.#recoverFailedTurns();
   }
 
   close(): void { this.db.close(); }
@@ -103,32 +131,227 @@ export class AgentBoardRuntime {
     return sequenced;
   }
 
+  #emitAgUi(session: AgentSession, event: Record<string, unknown> & { type: string }): void {
+    this.emit({
+      type: event.type,
+      taskId: session.taskId,
+      sessionId: session.id,
+      provider: session.provider,
+      payload: event,
+    });
+  }
+
+  #emitUserMessage(session: AgentSession, message: string, messageId = createId("message")): void {
+    const timestamp = Date.now();
+    this.#emitAgUi(session, { type: "TEXT_MESSAGE_START", messageId, role: "user", timestamp });
+    this.#emitAgUi(session, { type: "TEXT_MESSAGE_CONTENT", messageId, delta: message, timestamp });
+    this.#emitAgUi(session, { type: "TEXT_MESSAGE_END", messageId, timestamp });
+  }
+
   createProject(input: Pick<Project, "name" | "description">): Project {
     const at = now();
     return this.db.insertProject({ id: createId("project"), ...input, createdAt: at, updatedAt: at });
   }
 
+  async createWorkspaceHub(input: { name: string; rootPath?: string; branchName?: string }): Promise<WorkspaceHub> {
+    const at = now();
+    const id = createId("workspace");
+    const rootPath = input.rootPath
+      ? expandHome(input.rootPath)
+      : join(this.config.workspaceRoot, safeDirectoryName(input.name));
+    await mkdir(resolve(rootPath, ".."), { recursive: true });
+    try {
+      await mkdir(rootPath, { recursive: false });
+    } catch (error) {
+      throw badRequest(`Workspace directory cannot be created: ${messageOf(error)}`);
+    }
+    const legacyProject = this.createProject({ name: `Workspace: ${input.name}`, description: `Internal task container for ${rootPath}` });
+    const workspace = this.db.insertWorkspaceHub({
+      id, legacyProjectId: legacyProject.id, name: input.name, rootPath,
+      branchPrefix: input.branchName ?? `workspace/${id}`,
+      status: "ready", createdAt: at, updatedAt: at,
+    });
+    this.emit({ type: "workspace.created", taskId: null, sessionId: null, provider: null, payload: workspace });
+    return workspace;
+  }
+
+  workspaceHubDetails(workspaceId: string, includeTaskEvents = true): Record<string, unknown> {
+    const workspace = this.db.getWorkspaceHub(workspaceId);
+    if (!workspace) throw badRequest("Workspace not found");
+    const links = this.db.listWorkspaceHubProjects(workspace.id);
+    const projects = this.db.getManagedProjects(links.map((item) => item.projectId));
+    const byId = new Map(projects.map((item) => [item.id, item]));
+    const tasks = this.db.listTasks(workspace.legacyProjectId).map((task) =>
+      includeTaskEvents ? this.taskDetails(task.id) : this.taskSummary(task.id),
+    );
+    return {
+      workspace,
+      projects: links.map((link) => ({ ...byId.get(link.projectId), ...link })),
+      tasks,
+    };
+  }
+
+  listWorkspaceHubDetails(): Record<string, unknown>[] {
+    return this.db.listWorkspaceHubs().map((workspace) => this.workspaceHubDetails(workspace.id, false));
+  }
+
+  async addProjectToWorkspaceHub(workspaceId: string, input: { sourceType: "existing"; projectId: string } | { sourceType: "remote"; remoteUrl: string } | { sourceType: "local"; localPath: string }): Promise<{ project: ManagedProject; link: WorkspaceHubProject }> {
+    const workspace = this.db.getWorkspaceHub(workspaceId);
+    if (!workspace || workspace.status !== "ready") throw badRequest("Workspace not found or not ready");
+    const registered = this.db.listManagedProjects();
+    let project: ManagedProject | null = null;
+
+    if (input.sourceType === "existing") {
+      project = registered.find((item) => item.id === input.projectId) ?? null;
+      if (!project) throw badRequest("Project not found");
+    } else {
+      let remoteUrl: string;
+      if (input.sourceType === "local") {
+        try {
+          remoteUrl = await gitRemoteUrl(await validateGitRepository(resolve(input.localPath)));
+        } catch (error) {
+          throw badRequest(`Local repository is invalid: ${messageOf(error)}`);
+        }
+      } else remoteUrl = input.remoteUrl;
+      project = registered.find((item) => item.remoteUrl === remoteUrl) ?? null;
+      if (!project) {
+        const name = repositoryNameFromSource(remoteUrl);
+        if (registered.some((item) => item.name === name)) throw badRequest(`A different Project already uses the name "${name}"`);
+        let localPath: string;
+        let baseBranch: string;
+        try {
+          localPath = await cloneManagedRepository(remoteUrl, join(this.config.dataDirectory, "repositories", name));
+          baseBranch = await gitDefaultBranch(localPath);
+        } catch (error) {
+          throw badRequest(`Unable to clone Project: ${messageOf(error)}`);
+        }
+        const at = now();
+        project = this.db.insertManagedProject({ id: createId("project"), name, localPath, remoteUrl, baseBranch, createdAt: at, updatedAt: at });
+        this.emit({ type: "project.registered", taskId: null, sessionId: null, provider: null, payload: project });
+      }
+    }
+
+    if (this.db.listWorkspaceHubProjects(workspace.id).some((item) => item.projectId === project.id)) {
+      throw badRequest(`${project.name} is already in this Workspace`);
+    }
+    let worktree: Awaited<ReturnType<typeof addWorkspaceWorktree>>;
+    try {
+      worktree = await addWorkspaceWorktree(workspace.rootPath, {
+        repositoryId: project.id, repositoryName: project.name, repositoryPath: project.localPath,
+        directoryName: project.name, baseBranch: project.baseBranch, taskBranch: workspace.branchPrefix,
+      }, true);
+    } catch (error) {
+      throw badRequest(`Unable to create Project worktree: ${messageOf(error)}`);
+    }
+    const link = this.db.insertWorkspaceHubProject({
+      id: createId("workspaceProject"), workspaceId: workspace.id, projectId: project.id,
+      branch: worktree.taskBranch, worktreePath: worktree.worktreePath,
+      baseBranch: worktree.baseBranch, createdAt: now(),
+    });
+    this.emit({ type: "workspace.project-added", taskId: null, sessionId: null, provider: null, payload: { workspaceId, project, link } });
+    return { project, link };
+  }
+
+  async createAgentTask(workspaceId: string, input: { title: string; provider: AgentProvider; executorType: "native" | "docker"; prompt: string; executionProfileId?: string; startImmediately?: boolean }): Promise<Record<string, unknown>> {
+    const workspace = this.db.getWorkspaceHub(workspaceId);
+    if (!workspace) throw badRequest("Workspace not found");
+    if (!this.db.listWorkspaceHubProjects(workspace.id).length) throw badRequest("Add at least one Project before creating a Task");
+    const task = this.createTask({ projectId: workspace.legacyProjectId, title: input.title, description: input.prompt });
+    const at = now();
+    this.db.insertWorkspace({
+      id: createId("runtimeWorkspace"), taskId: task.id, rootPath: workspace.rootPath,
+      branchPrefix: workspace.branchPrefix, status: "ready", error: null, createdAt: at, updatedAt: at,
+    });
+    if (input.startImmediately !== false) {
+      await this.startSession(task.id, {
+        provider: input.provider, executorType: input.executorType, prompt: input.prompt,
+        ...(input.executionProfileId ? { executionProfileId: input.executionProfileId } : {}),
+      });
+    }
+    return { ...this.taskDetails(task.id), workspaceHub: workspace };
+  }
+
   async createRepository(projectId: string, input: { name: string; localPath?: string | null; remoteUrl?: string | null; baseBranch: string }): Promise<Repository> {
     if (!this.db.getProject(projectId)) throw new Error("Project not found");
-    let localPath: string;
-    if (input.localPath) {
-      localPath = await validateGitRepository(resolve(input.localPath));
-    } else if (input.remoteUrl) {
-      const cacheRoot = join(this.config.dataDirectory, "repositories", projectId);
-      await mkdir(cacheRoot, { recursive: true });
-      localPath = join(cacheRoot, safeDirectoryName(input.name));
-      await execFileAsync("git", ["clone", input.remoteUrl, localPath], { encoding: "utf8", maxBuffer: 20 * 1024 * 1024 });
-      localPath = await validateGitRepository(localPath);
-    } else {
-      throw new Error("Either localPath or remoteUrl is required");
-    }
+    if (Boolean(input.localPath) === Boolean(input.remoteUrl)) throw badRequest("Choose exactly one repository source: remote URL or local path");
+    const remoteUrl = input.localPath
+      ? await gitRemoteUrl(resolve(input.localPath))
+      : input.remoteUrl as string;
+    const cacheRoot = join(this.config.dataDirectory, "repositories", projectId);
+    const localPath = await cloneManagedRepository(remoteUrl, join(cacheRoot, safeDirectoryName(input.name)));
     const at = now();
     const repository = this.db.insertRepository({
       id: createId("repo"), projectId, name: input.name, localPath,
-      remoteUrl: input.remoteUrl ?? null, baseBranch: input.baseBranch, createdAt: at, updatedAt: at,
+      remoteUrl, baseBranch: input.baseBranch, createdAt: at, updatedAt: at,
     });
     this.emit({ type: "repository.created", taskId: null, sessionId: null, provider: null, payload: repository });
     return repository;
+  }
+
+  async addRepositoryToWorkspace(taskId: string, input: { sourceType: "remote"; remoteUrl: string } | { sourceType: "local"; localPath: string }): Promise<{ repository: Repository; workspaceRepository: WorkspaceRepository }> {
+    const task = this.db.getTask(taskId);
+    if (!task) throw badRequest("Task not found");
+    const workspace = this.db.getWorkspaceByTask(taskId);
+    if (!workspace || workspace.status !== "ready") throw badRequest("Create a ready Workspace before adding a Git project");
+
+    let remoteUrl: string;
+    if (input.sourceType === "local") {
+      try {
+        const sourcePath = await validateGitRepository(resolve(input.localPath));
+        remoteUrl = await gitRemoteUrl(sourcePath);
+      } catch (error) {
+        throw badRequest(`Local repository is invalid: ${messageOf(error)}`);
+      }
+    } else {
+      remoteUrl = input.remoteUrl;
+    }
+    const name = repositoryNameFromSource(remoteUrl);
+    const registered = this.db.listRepositories(task.projectId);
+    let repository = registered.find((item) => item.remoteUrl === remoteUrl) ?? null;
+
+    if (!repository) {
+      const conflictingName = registered.find((item) => item.name === name);
+      if (conflictingName) throw badRequest(`A different repository already uses the name "${name}" in this project`);
+      const cacheRoot = join(this.config.dataDirectory, "repositories", task.projectId);
+      let localPath: string;
+      let baseBranch: string;
+      try {
+        localPath = await cloneManagedRepository(remoteUrl, join(cacheRoot, name));
+        baseBranch = await gitDefaultBranch(localPath);
+      } catch (error) {
+        throw badRequest(`Unable to clone repository: ${messageOf(error)}`);
+      }
+      const at = now();
+      repository = this.db.insertRepository({
+        id: createId("repo"), projectId: task.projectId, name, localPath, remoteUrl,
+        baseBranch, createdAt: at, updatedAt: at,
+      });
+      this.emit({ type: "repository.created", taskId, sessionId: null, provider: null, payload: repository });
+    }
+
+    if (this.db.listWorkspaceRepositories(workspace.id).some((item) => item.repositoryId === repository.id)) {
+      throw badRequest(`${repository.name} is already linked to this Workspace`);
+    }
+    let worktree: Awaited<ReturnType<typeof addWorkspaceWorktree>>;
+    try {
+      worktree = await addWorkspaceWorktree(workspace.rootPath, {
+        repositoryId: repository.id,
+        repositoryName: repository.name,
+        repositoryPath: repository.localPath,
+        directoryName: repository.name,
+        baseBranch: repository.baseBranch,
+        taskBranch: workspace.branchPrefix,
+      }, true);
+    } catch (error) {
+      throw badRequest(`Unable to create Workspace worktree: ${messageOf(error)}`);
+    }
+    const workspaceRepository = this.db.insertWorkspaceRepository({
+      id: createId("workspaceRepo"), workspaceId: workspace.id, repositoryId: repository.id,
+      branch: worktree.taskBranch, worktreePath: worktree.worktreePath,
+      baseBranch: worktree.baseBranch, createdAt: now(),
+    });
+    this.emit({ type: "workspace.repository-added", taskId, sessionId: null, provider: null, payload: { repository, workspaceRepository } });
+    return { repository, workspaceRepository };
   }
 
   createTask(input: Pick<Task, "projectId" | "title" | "description">): Task {
@@ -149,9 +372,25 @@ export class AgentBoardRuntime {
     return {
       task,
       workspace,
+      workspaceHub: this.db.getWorkspaceHubByLegacyProject(task.projectId),
       workspaceRepositories: workspace ? this.db.listWorkspaceRepositories(workspace.id) : [],
       sessions: this.db.listSessions(taskId),
+      attempts: this.db.listSessions(taskId).flatMap((session) => this.db.listAttempts(session.id)),
+      messages: this.db.listMessages(taskId),
       interactions: this.db.listInteractions(taskId),
+      events: this.db.listEvents(taskId),
+    };
+  }
+
+  taskSummary(taskId: string): Record<string, unknown> {
+    const task = this.db.getTask(taskId);
+    if (!task) throw new Error("Task not found");
+    return {
+      task,
+      sessions: this.db.listSessions(taskId),
+      messages: this.db.listMessages(taskId),
+      interactions: this.db.listInteractions(taskId),
+      events: [],
     };
   }
 
@@ -223,6 +462,18 @@ export class AgentBoardRuntime {
   }
 
   async taskChanges(taskId: string): Promise<unknown[]> {
+    const task = this.db.getTask(taskId);
+    if (!task) throw new Error("Task not found");
+    const hub = this.db.getWorkspaceHubByLegacyProject(task.projectId);
+    if (hub) {
+      const links = this.db.listWorkspaceHubProjects(hub.id);
+      const projects = this.db.getManagedProjects(links.map((item) => item.projectId));
+      const byId = new Map(projects.map((project) => [project.id, project]));
+      return inspectChanges(links.map((item) => ({
+        repositoryId: item.projectId, repositoryName: byId.get(item.projectId)?.name ?? item.projectId,
+        worktreePath: item.worktreePath, baseBranch: item.baseBranch,
+      })));
+    }
     const workspace = this.db.getWorkspaceByTask(taskId);
     if (!workspace) throw new Error("Workspace not found");
     const worktrees = this.db.listWorkspaceRepositories(workspace.id);
@@ -299,31 +550,64 @@ export class AgentBoardRuntime {
     };
     this.db.insertSession(session);
     this.db.markTaskStarted(taskId, at);
-    const executor = input.executorType === "native" ? this.#native : this.#docker;
+    const initialMessage = this.db.insertMessage({
+      id: createId("message"), clientMessageId: createId("clientMessage"), taskId, sessionId: session.id,
+      role: "user", content: input.prompt, status: "queued", error: null,
+      createdAt: at, updatedAt: at, acceptedAt: null,
+    });
+    this.db.updateMessage(initialMessage.id, { status: "submitting", error: null }, now());
     try {
-      const handle = await this.#adapters[input.provider].start({
-        sessionId: session.id, taskId, workspacePath: workspace.rootPath, prompt: input.prompt, executor,
-        gatewayUrl: input.executorType === "docker" ? `http://host.docker.internal:${this.config.port}` : `http://${this.config.host}:${this.config.port}`,
-        hookToken: this.config.hookToken,
-        ...(profile?.image || input.image ? { image: profile?.image ?? input.image } : {}),
-        ...(profile ? { environment: profile.environment } : {}),
-      });
-      this.db.updateSession(session.id, { runtimeStatus: "running", providerSessionId: handle.providerSessionId }, now());
+      await this.#startAdapter(session, input.prompt, profile, profile?.image ?? input.image);
+      const acceptedAt = now();
+      this.db.updateMessage(initialMessage.id, { status: "accepted", error: null, acceptedAt }, acceptedAt);
+      this.#emitUserMessage(session, input.prompt, initialMessage.id);
       return this.db.getSession(session.id) as AgentSession;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      this.db.updateMessage(initialMessage.id, { status: "failed", error: message }, now());
       this.db.updateSession(session.id, { runtimeStatus: "failed", error: message, endedAt: now() }, now());
-      this.db.setTaskStatus(taskId, "in_review", now());
+      this.db.setTaskStatus(taskId, "needs_attention", now());
       throw error;
     }
   }
 
-  async sendMessage(sessionId: string, message: string): Promise<void> {
-    const session = this.db.getSession(sessionId);
-    if (!session) throw new Error("Session not found");
-    this.db.updateSession(sessionId, { runtimeStatus: "running" }, now());
-    this.db.setTaskStatus(session.taskId, "in_progress", now());
-    await this.#adapters[session.provider].sendMessage(sessionId, message);
+  async sendMessage(sessionId: string, content: string, clientMessageId = createId("clientMessage")): Promise<ConversationMessage> {
+    return this.#withSessionMessageLock(sessionId, async () => {
+      const session = this.db.getSession(sessionId);
+      if (!session) throw new Error("Session not found");
+      const at = now();
+      const persisted = this.db.insertMessage({
+        id: createId("message"), clientMessageId, taskId: session.taskId, sessionId,
+        role: "user", content, status: "queued", error: null, createdAt: at, updatedAt: at, acceptedAt: null,
+      });
+      if (persisted.status === "accepted") return persisted;
+      this.db.updateMessage(persisted.id, { status: "submitting", error: null }, now());
+      const adapter = this.#adapters[session.provider];
+      try {
+        if (adapter.isRunning(sessionId)) {
+          const attempt = this.db.latestAttempt(sessionId);
+          if (attempt) this.db.updateAttempt(attempt.id, { status: "running", error: null, endedAt: null }, now());
+          await adapter.sendMessage(sessionId, content);
+        } else {
+          const profile = session.executionProfileId ? this.db.getExecutionProfile(session.executionProfileId) : null;
+          await this.#startAdapter(session, content, profile, profile?.image ?? undefined);
+        }
+        const acceptedAt = now();
+        this.db.updateMessage(persisted.id, { status: "accepted", error: null, acceptedAt }, acceptedAt);
+        this.#emitUserMessage(session, content, persisted.id);
+        this.db.updateSession(sessionId, { runtimeStatus: "running", error: null, endedAt: null }, acceptedAt);
+        this.db.setTaskStatus(session.taskId, "in_progress", acceptedAt);
+        return this.db.getMessage(persisted.id) as ConversationMessage;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        this.db.updateMessage(persisted.id, { status: "failed", error: detail }, now());
+        this.emit({
+          type: "session.error", taskId: session.taskId, sessionId, provider: session.provider,
+          payload: { message: `Unable to send message: ${detail}`, willRetry: false },
+        });
+        throw new Error(`Unable to send message: ${detail}`);
+      }
+    });
   }
 
   async interruptSession(sessionId: string): Promise<void> {
@@ -336,6 +620,8 @@ export class AgentBoardRuntime {
     const session = this.db.getSession(sessionId);
     if (!session) throw new Error("Session not found");
     await this.#adapters[session.provider].terminate(sessionId);
+    const attempt = this.db.latestAttempt(sessionId);
+    if (attempt) this.db.updateAttempt(attempt.id, { status: "stopped", endedAt: now() }, now());
     this.#rejectSessionInteractions(sessionId, new Error("Session was terminated"));
     this.db.staleSessionInteractions(sessionId, now());
   }
@@ -351,6 +637,8 @@ export class AgentBoardRuntime {
     };
     this.db.insertInteraction(interaction);
     this.db.updateSession(sessionId, { runtimeStatus: "waiting" }, now());
+    const attempt = this.db.latestAttempt(sessionId);
+    if (attempt) this.db.updateAttempt(attempt.id, { status: "waiting" }, now());
     this.db.setTaskStatus(session.taskId, "needs_attention", now());
     this.emit({ type: "interaction.requested", taskId: session.taskId, sessionId, provider: session.provider, payload: interaction });
     this.#notify("Agents-Workspaces needs attention", interaction.title);
@@ -369,6 +657,8 @@ export class AgentBoardRuntime {
     this.#pendingInteractions.delete(id);
     this.db.resolveInteraction(id, now());
     this.db.updateSession(interaction.sessionId, { runtimeStatus: "running" }, now());
+    const attempt = this.db.latestAttempt(interaction.sessionId);
+    if (attempt) this.db.updateAttempt(attempt.id, { status: "running" }, now());
     this.#recomputeTaskStatus(interaction.taskId);
     this.emit({ type: "interaction.resolved", taskId: interaction.taskId, sessionId: interaction.sessionId, provider: interaction.provider, payload: { interactionId: id, response } });
     return this.db.getInteraction(id) as InteractionRequest;
@@ -378,42 +668,29 @@ export class AgentBoardRuntime {
     const session = this.db.getSession(sessionId);
     if (!session || session.provider !== "claude") throw new Error("Claude session not found");
     const hook = String(body.hook_event_name ?? "");
-    if (hook === "PermissionRequest") {
-      const result = await this.requestInteraction(sessionId, {
-        providerRequestId: `${String(body.session_id ?? sessionId)}:${Date.now()}`,
-        kind: "permission_request", title: "Claude Code permission request",
-        message: typeof body.tool_name === "string" ? `Tool: ${body.tool_name}` : undefined,
-        riskLevel: body.tool_name === "Bash" ? "high" : "medium", request: body,
-        availableDecisions: ["allow", "deny"],
-      });
-      return result;
-    }
-    if (hook === "PreToolUse" && body.tool_name === "AskUserQuestion") {
+    const parsedInteraction = parseClaudeCodeHook(body);
+    if (parsedInteraction) {
+      const interactionEvent = claudeCodeInteractionEvent(parsedInteraction);
+      this.#emitAgUi(session, interactionEvent as unknown as Record<string, unknown> & { type: string });
       const toolInput = body.tool_input && typeof body.tool_input === "object" ? body.tool_input as Record<string, unknown> : {};
-      const result = await this.requestInteraction(sessionId, {
-        providerRequestId: String(body.tool_use_id ?? `${String(body.session_id ?? sessionId)}:${Date.now()}`),
-        kind: "question", title: "Claude Code needs your answer",
-        message: "Answer these questions to continue the same Claude Code session.",
-        riskLevel: "low", request: { ...body, questions: toolInput.questions ?? [] },
-        availableDecisions: ["submit", "cancel"],
+      return this.requestInteraction(sessionId, {
+        providerRequestId: parsedInteraction.requestId,
+        kind: parsedInteraction.kind,
+        title: parsedInteraction.title,
+        ...(parsedInteraction.kind === "permission_request" && typeof body.tool_name === "string"
+          ? { message: `Tool: ${body.tool_name}` }
+          : parsedInteraction.kind === "question"
+            ? { message: "Answer these questions to continue the same Claude Code session." }
+            : typeof body.message === "string" ? { message: body.message } : {}),
+        riskLevel: parsedInteraction.riskLevel,
+        request: parsedInteraction.kind === "question" ? { ...body, questions: toolInput.questions ?? [] } : body,
+        availableDecisions: parsedInteraction.availableDecisions,
       });
-      return result;
     }
-    if (hook === "Elicitation") {
-      const result = await this.requestInteraction(sessionId, {
-        providerRequestId: String(body.elicitation_id ?? `${String(body.session_id ?? sessionId)}:${Date.now()}`),
-        kind: "form", title: "Claude Code needs your input",
-        message: typeof body.message === "string" ? body.message : undefined,
-        riskLevel: "low", request: body, availableDecisions: ["accept", "decline", "cancel"],
-      });
-      return result;
-    }
-    if (hook === "Stop") {
-      this.emit({ type: "turn.completed", taskId: session.taskId, sessionId, provider: "claude", payload: body });
-    } else if (hook === "SessionEnd") {
+    if (hook === "SessionEnd") {
       this.emit({ type: "session.ended", taskId: session.taskId, sessionId, provider: "claude", payload: body });
     } else {
-      this.emit({ type: "provider.hook", taskId: session.taskId, sessionId, provider: "claude", payload: body });
+      this.#emitAgUi(session, { type: "CUSTOM", name: "claude-code.hook", value: body, timestamp: Date.now() });
     }
     return {};
   }
@@ -439,6 +716,8 @@ export class AgentBoardRuntime {
         this.#rejectSessionInteractions(session.id, new Error("Task was cancelled"));
         this.db.staleSessionInteractions(session.id, now());
         this.db.updateSession(session.id, { runtimeStatus: "stopped", endedAt: now() }, now());
+        const attempt = this.db.latestAttempt(session.id);
+        if (attempt) this.db.updateAttempt(attempt.id, { status: "stopped", endedAt: now() }, now());
       }
     }
     this.db.setTaskStatus(taskId, "cancelled", now());
@@ -511,25 +790,51 @@ export class AgentBoardRuntime {
     if (!event.sessionId) return;
     const session = this.db.getSession(event.sessionId);
     if (!session) return;
-    if (event.type === "session.started" || event.type === "session.initialized") {
+    if (event.type === "session.started" || event.type === "session.initialized" || event.type === "RUN_STARTED") {
       const payload = event.payload as Record<string, unknown>;
       this.db.updateSession(session.id, {
         runtimeStatus: "running",
         ...(typeof payload.providerSessionId === "string" ? { providerSessionId: payload.providerSessionId } : {}),
       }, now());
-    } else if (event.type === "turn.completed") {
+      const attempt = this.db.latestAttempt(session.id);
+      if (attempt) this.db.updateAttempt(attempt.id, {
+        status: "running",
+        ...(typeof payload.providerSessionId === "string" ? { providerSessionId: payload.providerSessionId } : {}),
+      }, now());
+    } else if (event.type === "session.error" || event.type === "RUN_ERROR") {
       const payload = event.payload as Record<string, unknown>;
-      this.db.updateSession(session.id, { runtimeStatus: "stopped", summary: typeof payload.result === "string" ? payload.result : session.summary }, now());
+      if (payload.willRetry !== true) {
+        this.db.updateSession(session.id, { runtimeStatus: "failed", error: JSON.stringify(payload.error ?? payload) }, now());
+        const attempt = this.db.latestAttempt(session.id);
+        if (attempt) this.db.updateAttempt(attempt.id, { status: "failed", error: JSON.stringify(payload.error ?? payload), endedAt: now() }, now());
+        this.db.setTaskStatus(session.taskId, "needs_attention", now());
+        this.#notify("Agents-Workspaces Task failed", this.db.getTask(session.taskId)?.title ?? session.taskId);
+      }
+    } else if (event.type === "turn.completed" || event.type === "RUN_FINISHED") {
+      const payload = event.payload as Record<string, unknown>;
+      const turn = payload.turn && typeof payload.turn === "object" ? payload.turn as Record<string, unknown> : {};
+      const failed = turn.status === "failed" || payload.is_error === true;
+      this.db.updateSession(session.id, failed
+        ? { runtimeStatus: "failed", error: JSON.stringify(turn.error ?? payload.error ?? payload) }
+        : { runtimeStatus: "stopped", summary: typeof payload.result === "string" ? payload.result : session.summary }, now());
+      const attempt = this.db.latestAttempt(session.id);
+      if (attempt) this.db.updateAttempt(attempt.id, failed
+        ? { status: "failed", error: JSON.stringify(turn.error ?? payload.error ?? payload), endedAt: now() }
+        : { status: "idle", error: null }, now());
       this.db.staleSessionInteractions(session.id, now());
       this.#recomputeTaskStatus(session.taskId);
-      this.#notify("Agents-Workspaces review ready", this.db.getTask(session.taskId)?.title ?? session.taskId);
+      this.#notify(failed ? "Agents-Workspaces Task failed" : "Agents-Workspaces review ready", this.db.getTask(session.taskId)?.title ?? session.taskId);
     } else if (event.type === "session.failed") {
       this.db.updateSession(session.id, { runtimeStatus: "failed", error: JSON.stringify(event.payload), endedAt: now() }, now());
+      const attempt = this.db.latestAttempt(session.id);
+      if (attempt) this.db.updateAttempt(attempt.id, { status: "failed", error: JSON.stringify(event.payload), endedAt: now() }, now());
       this.#rejectSessionInteractions(session.id, new Error("Agent session failed"));
       this.db.staleSessionInteractions(session.id, now());
       this.#recomputeTaskStatus(session.taskId);
     } else if (event.type === "session.ended") {
       this.db.updateSession(session.id, { runtimeStatus: "stopped", endedAt: now() }, now());
+      const attempt = this.db.latestAttempt(session.id);
+      if (attempt) this.db.updateAttempt(attempt.id, { status: "completed", endedAt: now() }, now());
       this.#rejectSessionInteractions(session.id, new Error("Agent session ended"));
       this.db.staleSessionInteractions(session.id, now());
       this.#recomputeTaskStatus(session.taskId);
@@ -555,11 +860,77 @@ export class AgentBoardRuntime {
     execFile("osascript", ["-e", `display notification ${JSON.stringify(message)} with title ${JSON.stringify(title)}`], () => undefined);
   }
 
+  #recoverFailedTurns(): void {
+    const failed = new Map<string, { sessionId: string; error: string }>();
+    for (const event of this.db.listEvents(undefined, 0, 100_000)) {
+      if (!event.taskId || !event.sessionId) continue;
+      const payload = event.payload as Record<string, unknown>;
+      const turn = payload.turn && typeof payload.turn === "object" ? payload.turn as Record<string, unknown> : {};
+      if ((event.type === "RUN_ERROR") || (event.type === "session.error" && payload.willRetry !== true) || (event.type === "turn.completed" && (turn.status === "failed" || payload.is_error === true))) {
+        failed.set(event.taskId, { sessionId: event.sessionId, error: JSON.stringify(payload.error ?? turn.error ?? payload) });
+      } else if (event.type === "turn.completed" || event.type === "RUN_FINISHED" ||
+        event.type === "session.started" || event.type === "RUN_STARTED" || event.type === "turn.started") {
+        failed.delete(event.taskId);
+      }
+    }
+    for (const [taskId, value] of failed) {
+      this.db.updateSession(value.sessionId, { runtimeStatus: "failed", error: value.error }, now());
+      this.db.setTaskStatus(taskId, "needs_attention", now());
+    }
+  }
+
   #rejectSessionInteractions(sessionId: string, error: Error): void {
     for (const [id, pending] of this.#pendingInteractions) {
       if (pending.sessionId !== sessionId) continue;
       pending.reject(error);
       this.#pendingInteractions.delete(id);
+    }
+  }
+
+  async #startAdapter(session: AgentSession, prompt: string, profile: ExecutionProfile | null, image?: string): Promise<void> {
+    const workspace = this.db.getWorkspaceByTask(session.taskId);
+    if (!workspace || workspace.status !== "ready") throw new Error("A ready Workspace is required to resume this session");
+    const at = now();
+    const attempt: SessionAttempt = {
+      id: createId("attempt"), sessionId: session.id, status: "starting",
+      resumed: Boolean(session.providerSessionId), providerSessionId: session.providerSessionId,
+      error: null, startedAt: at, updatedAt: at, endedAt: null,
+    };
+    this.db.insertAttempt(attempt);
+    this.db.updateSession(session.id, { runtimeStatus: "starting", error: null, endedAt: null }, at);
+    const executor = session.executorType === "native" ? this.#native : this.#docker;
+    try {
+      const handle = await this.#adapters[session.provider].start({
+        sessionId: session.id, taskId: session.taskId, workspacePath: workspace.rootPath, prompt, executor,
+        gatewayUrl: session.executorType === "docker"
+          ? `http://host.docker.internal:${this.config.port}`
+          : `http://${this.config.host}:${this.config.port}`,
+        hookToken: this.config.hookToken,
+        ...(image ? { image } : {}),
+        ...(profile ? { environment: profile.environment } : {}),
+        ...(session.providerSessionId ? { providerSessionId: session.providerSessionId } : {}),
+      });
+      this.db.updateAttempt(attempt.id, { status: "running", providerSessionId: handle.providerSessionId, error: null }, now());
+      this.db.updateSession(session.id, { runtimeStatus: "running", providerSessionId: handle.providerSessionId, error: null, endedAt: null }, now());
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      this.db.updateAttempt(attempt.id, { status: "failed", error: detail, endedAt: now() }, now());
+      throw error;
+    }
+  }
+
+  async #withSessionMessageLock<T>(sessionId: string, work: () => Promise<T>): Promise<T> {
+    const previous = this.#sessionMessageQueues.get(sessionId) ?? Promise.resolve();
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const tail = previous.then(() => gate);
+    this.#sessionMessageQueues.set(sessionId, tail);
+    await previous;
+    try {
+      return await work();
+    } finally {
+      release();
+      if (this.#sessionMessageQueues.get(sessionId) === tail) this.#sessionMessageQueues.delete(sessionId);
     }
   }
 }

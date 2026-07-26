@@ -26,4 +26,18 @@ describe("deriveTaskStatus", () => {
   it("moves completed agent work to review", () => {
     assert.equal(deriveTaskStatus({ ...idle, hasStarted: true, reviewRequired: true }), "in_review");
   });
+
+  it("moves a failed Agent session to needs attention", () => {
+    assert.equal(deriveTaskStatus({
+      hasStarted: true, reviewRequired: true,
+      sessions: [{ runtimeStatus: "failed" }], interactions: [],
+    }), "needs_attention");
+  });
+
+  it("moves a resumable interrupted session to needs attention", () => {
+    assert.equal(deriveTaskStatus({
+      hasStarted: true, reviewRequired: true,
+      sessions: [{ runtimeStatus: "suspended" }], interactions: [],
+    }), "needs_attention");
+  });
 });

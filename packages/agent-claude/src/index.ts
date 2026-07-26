@@ -5,6 +5,12 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import type { AgentAdapter, AgentAdapterHooks, AgentSessionHandle, StartAgentInput } from "@agents-workspaces/agent-core";
 import type { ProcessHandle } from "@agents-workspaces/executor-core";
+import {
+  buildClaudeCodeUserMessage,
+  claudeCodeInteractionEvent,
+  ClaudeCodeEventAdapter,
+  parseClaudeCodeHook,
+} from "@agents-workspaces/ag-ui-claude-code";
 
 const execFileAsync = promisify(execFile);
 
@@ -13,13 +19,11 @@ interface ClaudeRuntime {
   process: ProcessHandle;
   providerSessionId: string;
   stdoutBuffer: string;
+  events: ClaudeCodeEventAdapter;
 }
 
 function streamUserMessage(message: string): string {
-  return `${JSON.stringify({
-    type: "user",
-    message: { role: "user", content: [{ type: "text", text: message }] },
-  })}\n`;
+  return `${buildClaudeCodeUserMessage(message)}\n`;
 }
 
 export async function writeClaudeHookSettings(workspacePath: string, gatewayUrl: string, sessionId: string): Promise<string> {
@@ -51,6 +55,8 @@ export class ClaudeAdapter implements AgentAdapter {
   readonly #sessions = new Map<string, ClaudeRuntime>();
 
   constructor(hooks: AgentAdapterHooks) { this.#hooks = hooks; }
+
+  isRunning(sessionId: string): boolean { return this.#sessions.has(sessionId); }
 
   async checkInstallation(): Promise<{ installed: boolean; version?: string; error?: string }> {
     try {
@@ -90,7 +96,13 @@ export class ClaudeAdapter implements AgentAdapter {
         ...(input.hookToken ? { AGENTS_WORKSPACES_HOOK_TOKEN: input.hookToken } : {}),
       },
     });
-    const runtime: ClaudeRuntime = { input, process, providerSessionId, stdoutBuffer: "" };
+    const runtime: ClaudeRuntime = {
+      input,
+      process,
+      providerSessionId,
+      stdoutBuffer: "",
+      events: new ClaudeCodeEventAdapter({ threadId: providerSessionId, runId: input.sessionId }),
+    };
     this.#sessions.set(input.sessionId, runtime);
     process.onOutput((stream, data) => {
       if (stream === "stderr") this.#emit(runtime, "session.log", { stream, data });
@@ -106,7 +118,9 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
   async sendMessage(sessionId: string, message: string): Promise<void> {
-    this.#required(sessionId).process.write(streamUserMessage(message));
+    const runtime = this.#required(sessionId);
+    runtime.events.setContext({ runId: randomUUID() });
+    runtime.process.write(streamUserMessage(message));
   }
 
   async interrupt(sessionId: string): Promise<void> { this.#required(sessionId).process.interrupt(); }
@@ -127,21 +141,11 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
   #handle(runtime: ClaudeRuntime, message: Record<string, unknown>): void {
-    const type = String(message.type ?? "provider.event");
-    if (type === "system" && typeof message.session_id === "string") {
+    if (message.type === "system" && typeof message.session_id === "string") {
       runtime.providerSessionId = message.session_id;
-      this.#emit(runtime, "session.initialized", message);
-    } else if (type === "assistant") {
-      this.#emit(runtime, "message.delta", message);
-    } else if (type === "stream_event") {
-      this.#emit(runtime, "message.delta", message);
-    } else if (type === "result") {
-      this.#emit(runtime, message.is_error ? "session.failed" : "turn.completed", message);
-    } else if (type.includes("hook")) {
-      this.#emit(runtime, "provider.hook", message);
-    } else {
-      this.#emit(runtime, "provider.event", message);
+      runtime.events.setContext({ threadId: runtime.providerSessionId });
     }
+    for (const event of runtime.events.adapt(message)) this.#emit(runtime, event.type, event);
   }
 
   #required(sessionId: string): ClaudeRuntime {
@@ -159,3 +163,5 @@ export const claudeAdapterMetadata = {
   provider: "claude", transports: ["stream-json", "http-hooks", "mcp-bridge"],
   supportedInteractions: ["command_approval", "permission_request", "question", "form"],
 } as const;
+
+export { claudeCodeInteractionEvent, parseClaudeCodeHook };

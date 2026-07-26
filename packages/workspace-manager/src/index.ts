@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, realpath, rmdir, stat } from "node:fs/promises";
+import { mkdir, realpath, rename, rm, rmdir, stat } from "node:fs/promises";
 import { basename, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { RepositoryChanges } from "@agents-workspaces/core";
@@ -54,8 +54,73 @@ export async function validateGitRepository(repositoryPath: string): Promise<str
   return resolved;
 }
 
+export async function gitRemoteUrl(repositoryPath: string, remote = "origin"): Promise<string> {
+  const root = await validateGitRepository(repositoryPath);
+  try {
+    return await git(root, ["remote", "get-url", remote]);
+  } catch {
+    throw new Error(`${repositoryPath} does not have a ${remote} remote`);
+  }
+}
+
+export async function gitDefaultBranch(repositoryPath: string): Promise<string> {
+  const root = await validateGitRepository(repositoryPath);
+  try {
+    const remoteHead = await git(root, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]);
+    return remoteHead.replace(/^origin\//, "");
+  } catch {
+    const current = await git(root, ["branch", "--show-current"]);
+    if (current) return current;
+    throw new Error(`Cannot determine the default branch for ${repositoryPath}`);
+  }
+}
+
+export function repositoryNameFromSource(source: string): string {
+  const withoutQuery = source.trim().replace(/[?#].*$/, "").replace(/[\\/]+$/, "");
+  const lastSegment = withoutQuery.split(/[\\/:]/).filter(Boolean).at(-1) ?? "";
+  return safeDirectoryName(lastSegment.replace(/\.git$/i, ""));
+}
+
+export async function cloneManagedRepository(source: string, destination: string): Promise<string> {
+  const target = resolve(destination);
+  const parent = resolve(target, "..");
+  await mkdir(parent, { recursive: true });
+  try {
+    await stat(target);
+    throw new Error(`Managed repository already exists: ${target}`);
+  } catch (error) {
+    if (error instanceof Error && !((error as NodeJS.ErrnoException).code === "ENOENT")) throw error;
+  }
+
+  const temporary = `${target}.cloning-${crypto.randomUUID()}`;
+  try {
+    await execFileAsync("git", ["clone", source, temporary], { encoding: "utf8", maxBuffer: 20 * 1024 * 1024 });
+    await rename(temporary, target);
+    return await validateGitRepository(target);
+  } catch (error) {
+    await rm(temporary, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+export async function addWorkspaceWorktree(workspacePath: string, item: WorkspaceRepositoryInput, fetch = false): Promise<CreatedWorktree> {
+  const resolvedWorkspace = await realpath(workspacePath);
+  const workspaceInfo = await stat(resolvedWorkspace);
+  if (!workspaceInfo.isDirectory()) throw new Error(`${workspacePath} is not a directory`);
+  const repositoryPath = await validateGitRepository(item.repositoryPath);
+  if (fetch) await git(repositoryPath, ["fetch", "--prune"]);
+  await git(repositoryPath, ["rev-parse", "--verify", item.baseBranch]);
+  const directoryName = safeDirectoryName(item.directoryName || item.repositoryName || basename(repositoryPath));
+  const worktreePath = join(resolvedWorkspace, directoryName);
+  const branchExists = await git(repositoryPath, ["branch", "--list", item.taskBranch]);
+  const args = branchExists
+    ? ["worktree", "add", worktreePath, item.taskBranch]
+    : ["worktree", "add", "-b", item.taskBranch, worktreePath, item.baseBranch];
+  await git(repositoryPath, args);
+  return { ...item, repositoryPath, directoryName, worktreePath };
+}
+
 export async function createWorkspace(input: CreateWorkspaceInput): Promise<{ workspacePath: string; worktrees: CreatedWorktree[] }> {
-  if (input.repositories.length === 0) throw new Error("At least one repository is required");
   await mkdir(resolve(input.rootPath), { recursive: true });
   const workspacePath = resolveWorkspacePath(input.rootPath, input.taskId);
   await mkdir(workspacePath, { recursive: false });
@@ -63,17 +128,7 @@ export async function createWorkspace(input: CreateWorkspaceInput): Promise<{ wo
 
   try {
     for (const item of input.repositories) {
-      const repositoryPath = await validateGitRepository(item.repositoryPath);
-      if (input.fetch) await git(repositoryPath, ["fetch", "--prune"]);
-      await git(repositoryPath, ["rev-parse", "--verify", item.baseBranch]);
-      const directoryName = safeDirectoryName(item.directoryName || item.repositoryName || basename(repositoryPath));
-      const worktreePath = join(workspacePath, directoryName);
-      const branchExists = await git(repositoryPath, ["branch", "--list", item.taskBranch]);
-      const args = branchExists
-        ? ["worktree", "add", worktreePath, item.taskBranch]
-        : ["worktree", "add", "-b", item.taskBranch, worktreePath, item.baseBranch];
-      await git(repositoryPath, args);
-      created.push({ ...item, repositoryPath, directoryName, worktreePath });
+      created.push(await addWorkspaceWorktree(workspacePath, item, input.fetch));
     }
     return { workspacePath, worktrees: created };
   } catch (error) {

@@ -18,6 +18,21 @@ P0 已实现，当前仓库包含：
 - 六列实时看板、应用内创建表单、审批/问答、代码 Diff 与 Review；
 - Native 与本机 Docker 执行、独立凭证卷和安全的 Claude HTTP Hook 回调。
 
+## Workspace、Project 与 Task 流程
+
+1. 先创建 Workspace，指定名称、目录和可选的共享分支名；
+2. 向 Workspace 添加一个或多个 Project：
+   - `Existing`：复用已经登记的受管 Project；
+   - `Clone URL`：克隆远端仓库并登记为 Project；
+   - `Local repository`：读取本地仓库的 `origin`，重新克隆后登记；
+3. 系统从全局受管 Clone 创建 Worktree，并放入 Workspace；
+4. 在 Workspace 中创建多个 Task，每个 Task 对应一个 Codex 或 Claude Code CLI 进程；
+5. CLI 始终以 Workspace 根目录作为 `cwd`，Chat、审批、问答、文件变化和事件统一进入看板。
+
+本地来源仓库不会被 Agent 直接修改。同一 Workspace 中的多个 Task 共享相同 Worktree，因此适合按 Project 或目录划分并行职责。
+
+Web UI 提供两种共享状态的视图：Chat 视图用于按 Workspace 深入处理完整对话，Board 视图用于按 Workspace 筛选所有 Task 的状态。Provider 只在创建 Task 和 Task 详情中显示，鉴权在全局设置中配置一次。
+
 ## 环境要求
 
 - macOS
@@ -50,6 +65,32 @@ pnpm login:claude
 ```
 
 开发时也可以分别启动：
+
+```bash
+pnpm dev
+```
+
+`pnpm dev` 会先构建并关联主工程同级 `../ag-ui` 仓库中的 AG-UI Core、Codex App Server Adapter 和 Claude Code Adapter，然后同时启动 daemon 与 web。AG-UI 仓库位于其他位置时，可通过 `AG_UI_REPO_PATH` 指定：
+
+```bash
+AG_UI_REPO_PATH=/absolute/path/to/ag-ui pnpm dev
+```
+
+如需跳过完整启动、只刷新 AG-UI 本地 SDK 链接，可以执行：
+
+```bash
+pnpm ag-ui:prepare
+```
+
+Agent 会话使用 AG-UI 标准事件持久化和实时传输，包括 `RUN_*`、`TEXT_MESSAGE_*`、`TOOL_CALL_*` 与 `REASONING_*`。Workspace、Project、Task 和 Review 等产品领域事件仍使用 Agents-Workspaces 自身的事件模型；已有任务中的旧版会话事件继续兼容显示。
+
+开发进程由 `scripts/dev.mjs` 统一管理。按一次 `Ctrl+C` 会向 daemon、web 及其 watcher 的完整进程组转发退出信号，等待 3 秒后仍未退出则强制清理。Web 端口被占用时会直接报错，不会自动切换到 4312。仅在进程被强制关闭或机器断电、且留下受管 PID 记录时，可以执行：
+
+```bash
+pnpm dev:cleanup
+```
+
+也可以分别启动 daemon 和 web（这种方式不会自动重新构建 AG-UI）：
 
 ```bash
 pnpm dev:daemon

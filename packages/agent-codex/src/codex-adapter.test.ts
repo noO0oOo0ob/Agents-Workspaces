@@ -21,6 +21,7 @@ class FakeProcess implements ProcessHandle {
   }
   respond(id: unknown, result: unknown): void { queueMicrotask(() => this.events.emit("output", "stdout", `${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`)); }
   serverRequest(message: Record<string, unknown>): void { this.events.emit("output", "stdout", `${JSON.stringify(message)}\n`); }
+  notification(method: string, params: Record<string, unknown>): void { this.serverRequest({ jsonrpc: "2.0", method, params }); }
   interrupt(): void {}
   terminate(): void {}
   onOutput(listener: (stream: "stdout" | "stderr", data: string) => void): () => void { this.events.on("output", listener); return () => this.events.off("output", listener); }
@@ -60,5 +61,13 @@ describe("CodexAdapter", () => {
     const response = executor.process.writes.find((message) => message.id === 99);
     assert.deepEqual(response?.result, { decision: "accept" });
     assert.ok(events.some((event) => event.type === "session.started"));
+    executor.process.notification("turn/started", { turn: { id: "turn-1" } });
+    executor.process.notification("item/agentMessage/delta", { itemId: "message-1", delta: "Hello" });
+    executor.process.notification("item/completed", { item: { id: "message-1", type: "agentMessage", text: "Hello" } });
+    executor.process.notification("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(events.some((event) => event.type === "RUN_STARTED"));
+    assert.ok(events.some((event) => event.type === "TEXT_MESSAGE_CONTENT" && (event.payload as { delta?: string }).delta === "Hello"));
+    assert.ok(events.some((event) => event.type === "RUN_FINISHED"));
   });
 });

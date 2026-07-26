@@ -10,13 +10,15 @@
     "pnpm": ">=10.0.0"
   },
   "scripts": {
-    "dev": "concurrently -n daemon,web -c cyan,magenta \"pnpm dev:daemon\" \"pnpm dev:web\"",
+    "ag-ui:prepare": "node scripts/prepare-ag-ui.mjs",
+    "dev": "pnpm ag-ui:prepare && node scripts/dev.mjs",
     "dev:daemon": "pnpm --filter @agents-workspaces/daemon dev",
     "dev:web": "pnpm --filter @agents-workspaces/web dev",
+    "dev:cleanup": "node scripts/dev-cleanup.mjs",
     "start": "tsx apps/cli/src/index.ts start",
     "build": "pnpm typecheck && pnpm --filter @agents-workspaces/web build",
-    "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test packages/*/src/*.test.ts apps/*/src/*.test.ts",
+    "typecheck": "pnpm ag-ui:prepare && tsc --noEmit",
+    "test": "pnpm ag-ui:prepare && node --import tsx --test packages/*/src/*.test.ts apps/*/src/*.test.ts",
     "test:watch": "node --import tsx --test --watch packages/*/src/*.test.ts apps/*/src/*.test.ts",
     "format:check": "prettier --check .",
     "format": "prettier --write .",
