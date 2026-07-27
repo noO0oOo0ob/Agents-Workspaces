@@ -1,0 +1,52 @@
+{
+  "name": "agents-workspaces",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local multi-agent workspace orchestrator for Codex and Claude Code",
+  "type": "module",
+  "packageManager": "pnpm@10.23.0",
+  "engines": {
+    "node": ">=22.0.0",
+    "pnpm": ">=10.0.0"
+  },
+  "scripts": {
+    "ag-ui:prepare": "node scripts/prepare-ag-ui.mjs",
+    "dev": "pnpm ag-ui:prepare && node scripts/dev.mjs",
+    "dev:daemon": "pnpm --filter @agents-workspaces/daemon dev",
+    "dev:web": "pnpm --filter @agents-workspaces/web dev",
+    "dev:cleanup": "node scripts/dev-cleanup.mjs",
+    "start": "tsx apps/cli/src/index.ts start",
+    "build": "pnpm typecheck && pnpm --filter @agents-workspaces/web build",
+    "typecheck": "pnpm ag-ui:prepare && tsc --noEmit",
+    "test": "pnpm ag-ui:prepare && node --import tsx --test packages/*/src/*.test.ts apps/*/src/*.test.ts",
+    "test:watch": "node --import tsx --test --watch packages/*/src/*.test.ts apps/*/src/*.test.ts",
+    "format:check": "prettier --check .",
+    "format": "prettier --write .",
+    "doctor": "pnpm --filter @agents-workspaces/cli dev doctor",
+    "login:codex": "pnpm --filter @agents-workspaces/cli dev login codex",
+    "login:claude": "pnpm --filter @agents-workspaces/cli dev login claude",
+    "docker:build": "docker build -f docker/base/Dockerfile -t agents-workspaces-runner:local ."
+  },
+  "dependencies": {
+    "fastify": "^5.2.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.2",
+    "prettier": "^3.5.3",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2",
+    "vite": "^6.2.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}
