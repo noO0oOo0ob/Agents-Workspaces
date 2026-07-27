@@ -4,43 +4,20 @@ import staticPlugin from "@fastify/static";
 import websocket from "@fastify/websocket";
 import Fastify, { type FastifyInstance } from "fastify";
 import { z } from "zod";
+import { registerAgUiGateway } from "./ag-ui-gateway.js";
 import { AgentBoardRuntime } from "./runtime.js";
 
 const idParams = z.object({ id: z.string().min(1) });
-const projectInput = z.object({ name: z.string().trim().min(1).max(120), description: z.string().trim().default("") });
-const repositoryInput = z.object({
-  name: z.string().trim().min(1).max(120),
-  localPath: z.string().trim().min(1).nullable().optional(),
-  remoteUrl: z.string().trim().nullable().default(null),
-  baseBranch: z.string().trim().min(1).default("main"),
-}).refine((value) => Boolean(value.localPath) !== Boolean(value.remoteUrl), {
-  message: "Choose exactly one repository source: remote URL or local path",
-});
-const workspaceRepositoryInput = z.discriminatedUnion("sourceType", [
-  z.object({ sourceType: z.literal("remote"), remoteUrl: z.string().trim().min(1) }),
-  z.object({ sourceType: z.literal("local"), localPath: z.string().trim().min(1) }),
-]);
-const taskInput = z.object({ projectId: z.string().min(1), title: z.string().trim().min(1).max(200), description: z.string().trim().default("") });
-const workspaceInput = z.object({
-  repositoryIds: z.array(z.string().min(1)).default([]), rootPath: z.string().optional(),
-  branchName: z.string().optional(), fetch: z.boolean().default(false),
-  knowledgeSources: z.array(z.object({ path: z.string(), scope: z.enum(["global", "project", "repository", "task"]), title: z.string().optional() })).default([]),
-});
-const sessionInput = z.object({
-  provider: z.enum(["codex", "claude"]), executorType: z.enum(["native", "docker"]),
-  executionProfileId: z.string().optional(), prompt: z.string().trim().min(1), image: z.string().optional(),
-});
 const profileInput = z.object({
   name: z.string().trim().min(1), type: z.enum(["native", "docker"]), provider: z.enum(["codex", "claude"]),
   image: z.string().nullable().default(null), environment: z.record(z.string()).default({}),
 });
-const workspaceHubInput = z.object({
+const workspaceInput = z.object({
   name: z.string().trim().min(1).max(120),
   rootPath: z.string().trim().min(1).optional(),
   branchName: z.string().trim().min(1).optional(),
 });
 const workspaceProjectInput = z.discriminatedUnion("sourceType", [
-  z.object({ sourceType: z.literal("existing"), projectId: z.string().min(1) }),
   z.object({ sourceType: z.literal("remote"), remoteUrl: z.string().trim().min(1) }),
   z.object({ sourceType: z.literal("local"), localPath: z.string().trim().min(1) }),
 ]);
@@ -95,20 +72,21 @@ export async function createApp(runtime = new AgentBoardRuntime()): Promise<Fast
   });
 
   app.get("/api/health", async () => runtime.health());
+  registerAgUiGateway(app, runtime);
 
-  app.get("/api/workspaces", async () => ({ items: runtime.listWorkspaceHubDetails() }));
+  app.get("/api/workspaces", async () => ({ items: runtime.listWorkspaceDetails() }));
   app.post("/api/workspaces", async (request, reply) => {
-    const input = parsed(workspaceHubInput, request.body);
-    return reply.code(201).send(await runtime.createWorkspaceHub({
+    const input = parsed(workspaceInput, request.body);
+    return reply.code(201).send(await runtime.createWorkspace({
       name: input.name,
       ...(input.rootPath ? { rootPath: input.rootPath } : {}),
       ...(input.branchName ? { branchName: input.branchName } : {}),
     }));
   });
-  app.get("/api/workspaces/:id", async (request) => runtime.workspaceHubDetails(parsed(idParams, request.params).id));
+  app.get("/api/workspaces/:id", async (request) => runtime.workspaceDetails(parsed(idParams, request.params).id));
   app.post("/api/workspaces/:id/projects", async (request, reply) => {
     const { id } = parsed(idParams, request.params);
-    return reply.code(201).send(await runtime.addProjectToWorkspaceHub(id, parsed(workspaceProjectInput, request.body)));
+    return reply.code(201).send(await runtime.addProjectToWorkspace(id, parsed(workspaceProjectInput, request.body)));
   });
   app.post("/api/workspaces/:id/tasks", async (request, reply) => {
     const { id } = parsed(idParams, request.params);
@@ -119,89 +97,16 @@ export async function createApp(runtime = new AgentBoardRuntime()): Promise<Fast
       ...(input.executionProfileId ? { executionProfileId: input.executionProfileId } : {}),
     }));
   });
-  app.get("/api/project-registry", async () => ({ items: runtime.db.listManagedProjects() }));
-
-  app.get("/api/projects", async () => ({ items: runtime.db.listProjects() }));
-  app.post("/api/projects", async (request, reply) => {
-    const input = parsed(projectInput, request.body);
-    return reply.code(201).send(runtime.createProject({ name: input.name, description: input.description ?? "" }));
-  });
-  app.get("/api/projects/:id/repositories", async (request) => {
-    const { id } = parsed(idParams, request.params);
-    return { items: runtime.db.listRepositories(id) };
-  });
-  app.post("/api/projects/:id/repositories", async (request, reply) => {
-    const { id } = parsed(idParams, request.params);
-    const input = parsed(repositoryInput, request.body);
-    return reply.code(201).send(await runtime.createRepository(id, {
-      name: input.name, localPath: input.localPath ?? null, remoteUrl: input.remoteUrl ?? null, baseBranch: input.baseBranch ?? "main",
-    }));
-  });
-
-  app.get("/api/tasks", async (request) => {
-    const query = parsed(z.object({ projectId: z.string().optional() }), request.query);
-    return { items: runtime.db.listTasks(query.projectId).map((task) => runtime.taskDetails(task.id)) };
-  });
-  app.post("/api/tasks", async (request, reply) => {
-    const input = parsed(taskInput, request.body);
-    return reply.code(201).send(runtime.createTask({ projectId: input.projectId, title: input.title, description: input.description ?? "" }));
-  });
-  app.get("/api/tasks/:id", async (request) => runtime.taskDetails(parsed(idParams, request.params).id));
-  app.post("/api/tasks/:id/messages", async (request, reply) => {
-    const { id } = parsed(idParams, request.params);
-    const { message, clientMessageId } = parsed(z.object({ message: z.string().trim().min(1), clientMessageId: z.string().min(1).optional() }), request.body);
-    const session = runtime.db.listSessions(id).at(-1);
-    if (!session) return reply.code(400).send({ error: "invalid_request", message: "Task has no Agent session" });
-    const persisted = await runtime.sendMessage(session.id, message, clientMessageId);
-    return reply.code(202).send({ accepted: true, message: persisted });
-  });
-  app.post("/api/tasks/:id/workspace", async (request, reply) => {
-    const { id } = parsed(idParams, request.params);
-    const input = parsed(workspaceInput, request.body);
-    return reply.code(201).send(await runtime.createTaskWorkspace(id, input.repositoryIds ?? [], {
-      ...(input.rootPath ? { rootPath: input.rootPath } : {}),
-      ...(input.branchName ? { branchName: input.branchName } : {}),
-      fetch: input.fetch ?? false,
-      knowledgeSources: (input.knowledgeSources ?? []).map((source) => ({
-        path: source.path, scope: source.scope, ...(source.title ? { title: source.title } : {}),
-      })),
-    }));
-  });
-  app.post("/api/tasks/:id/workspace/repositories", async (request, reply) => {
-    const { id } = parsed(idParams, request.params);
-    const input = parsed(workspaceRepositoryInput, request.body);
-    return reply.code(201).send(await runtime.addRepositoryToWorkspace(id, input));
-  });
   app.get("/api/tasks/:id/changes", async (request) => ({ items: await runtime.taskChanges(parsed(idParams, request.params).id) }));
-  app.post("/api/tasks/:id/workspace/cleanup", async (request) => {
-    const body = parsed(z.object({ force: z.boolean().default(false) }), request.body);
-    return runtime.cleanupWorkspace(parsed(idParams, request.params).id, body.force ?? false);
-  });
-  app.post("/api/tasks/:id/sessions", async (request, reply) => {
-    const { id } = parsed(idParams, request.params);
-    const input = parsed(sessionInput, request.body);
-    return reply.code(201).send(await runtime.startSession(id, {
-      provider: input.provider, executorType: input.executorType, prompt: input.prompt,
-      ...(input.executionProfileId ? { executionProfileId: input.executionProfileId } : {}),
-      ...(input.image ? { image: input.image } : {}),
-    }));
-  });
   app.post("/api/tasks/:id/review/approve", async (request) => runtime.approveReview(parsed(idParams, request.params).id));
   app.post("/api/tasks/:id/review/request-changes", async (request) => runtime.requestChanges(parsed(idParams, request.params).id));
+  app.post("/api/tasks/:id/archive", async (request) => runtime.archiveTask(parsed(idParams, request.params).id));
+  app.delete("/api/tasks/:id", async (request) => runtime.deleteTask(parsed(idParams, request.params).id));
   app.post("/api/tasks/:id/cancel", async (request) => runtime.cancelTask(parsed(idParams, request.params).id));
   app.post("/api/tasks/:id/knowledge-candidates", async (request) => {
     const { title, content } = parsed(z.object({ title: z.string().trim().min(1), content: z.string().trim().min(1) }), request.body);
     return runtime.saveKnowledgeCandidate(parsed(idParams, request.params).id, title, content);
   });
-
-  app.post("/api/sessions/:id/messages", async (request, reply) => {
-    const { id } = parsed(idParams, request.params);
-    const { message, clientMessageId } = parsed(z.object({ message: z.string().trim().min(1), clientMessageId: z.string().min(1).optional() }), request.body);
-    const persisted = await runtime.sendMessage(id, message, clientMessageId);
-    return reply.code(202).send({ accepted: true, message: persisted });
-  });
-  app.post("/api/sessions/:id/interrupt", async (request) => { await runtime.interruptSession(parsed(idParams, request.params).id); return { ok: true }; });
-  app.post("/api/sessions/:id/terminate", async (request) => { await runtime.terminateSession(parsed(idParams, request.params).id); return { ok: true }; });
 
   app.get("/api/interactions", async (request) => {
     const query = parsed(z.object({ taskId: z.string().optional(), status: z.string().optional() }), request.query);

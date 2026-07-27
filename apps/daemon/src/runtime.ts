@@ -13,35 +13,28 @@ import {
   deriveTaskStatus,
   now,
   type AgentEvent,
+  type AgentRun,
   type AgentProvider,
   type AgentSession,
   type ConversationMessage,
   type ExecutionProfile,
   type InteractionRequest,
-  type Project,
-  type Repository,
   type Task,
   type Workspace,
-  type WorkspaceRepository,
-  type WorkspaceHub,
-  type ManagedProject,
-  type WorkspaceHubProject,
+  type Project,
+  type WorkspaceProject,
   type SessionAttempt,
 } from "@agents-workspaces/core";
 import { AppDatabase, createDatabaseConfig } from "@agents-workspaces/database";
 import { DockerExecutor } from "@agents-workspaces/executor-docker";
 import { NativeExecutor } from "@agents-workspaces/executor-native";
-import { writeCompiledContexts, type KnowledgeSourceInput } from "@agents-workspaces/knowledge-compiler";
 import {
   addWorkspaceWorktree,
   cloneManagedRepository,
-  createWorkspace,
   gitDefaultBranch,
   gitRemoteUrl,
   inspectChanges,
-  removeWorkspaceWorktrees,
   repositoryNameFromSource,
-  resolveWorkspacePath,
   safeDirectoryName,
   validateGitRepository,
 } from "@agents-workspaces/workspace-manager";
@@ -148,12 +141,7 @@ export class AgentBoardRuntime {
     this.#emitAgUi(session, { type: "TEXT_MESSAGE_END", messageId, timestamp });
   }
 
-  createProject(input: Pick<Project, "name" | "description">): Project {
-    const at = now();
-    return this.db.insertProject({ id: createId("project"), ...input, createdAt: at, updatedAt: at });
-  }
-
-  async createWorkspaceHub(input: { name: string; rootPath?: string; branchName?: string }): Promise<WorkspaceHub> {
+  async createWorkspace(input: { name: string; rootPath?: string; branchName?: string }): Promise<Workspace> {
     const at = now();
     const id = createId("workspace");
     const rootPath = input.rootPath
@@ -165,9 +153,8 @@ export class AgentBoardRuntime {
     } catch (error) {
       throw badRequest(`Workspace directory cannot be created: ${messageOf(error)}`);
     }
-    const legacyProject = this.createProject({ name: `Workspace: ${input.name}`, description: `Internal task container for ${rootPath}` });
-    const workspace = this.db.insertWorkspaceHub({
-      id, legacyProjectId: legacyProject.id, name: input.name, rootPath,
+    const workspace = this.db.insertWorkspace({
+      id, name: input.name, rootPath,
       branchPrefix: input.branchName ?? `workspace/${id}`,
       status: "ready", createdAt: at, updatedAt: at,
     });
@@ -175,13 +162,13 @@ export class AgentBoardRuntime {
     return workspace;
   }
 
-  workspaceHubDetails(workspaceId: string, includeTaskEvents = true): Record<string, unknown> {
-    const workspace = this.db.getWorkspaceHub(workspaceId);
+  workspaceDetails(workspaceId: string, includeTaskEvents = true): Record<string, unknown> {
+    const workspace = this.db.getWorkspace(workspaceId);
     if (!workspace) throw badRequest("Workspace not found");
-    const links = this.db.listWorkspaceHubProjects(workspace.id);
-    const projects = this.db.getManagedProjects(links.map((item) => item.projectId));
+    const links = this.db.listWorkspaceProjects(workspace.id);
+    const projects = this.db.getProjects(links.map((item) => item.projectId));
     const byId = new Map(projects.map((item) => [item.id, item]));
-    const tasks = this.db.listTasks(workspace.legacyProjectId).map((task) =>
+    const tasks = this.db.listTasks(workspace.id).map((task) =>
       includeTaskEvents ? this.taskDetails(task.id) : this.taskSummary(task.id),
     );
     return {
@@ -191,47 +178,38 @@ export class AgentBoardRuntime {
     };
   }
 
-  listWorkspaceHubDetails(): Record<string, unknown>[] {
-    return this.db.listWorkspaceHubs().map((workspace) => this.workspaceHubDetails(workspace.id, false));
+  listWorkspaceDetails(): Record<string, unknown>[] {
+    return this.db.listWorkspaces().map((workspace) => this.workspaceDetails(workspace.id, false));
   }
 
-  async addProjectToWorkspaceHub(workspaceId: string, input: { sourceType: "existing"; projectId: string } | { sourceType: "remote"; remoteUrl: string } | { sourceType: "local"; localPath: string }): Promise<{ project: ManagedProject; link: WorkspaceHubProject }> {
-    const workspace = this.db.getWorkspaceHub(workspaceId);
+  async addProjectToWorkspace(workspaceId: string, input: { sourceType: "remote"; remoteUrl: string } | { sourceType: "local"; localPath: string }): Promise<{ project: Project; link: WorkspaceProject }> {
+    const workspace = this.db.getWorkspace(workspaceId);
     if (!workspace || workspace.status !== "ready") throw badRequest("Workspace not found or not ready");
-    const registered = this.db.listManagedProjects();
-    let project: ManagedProject | null = null;
+    let remoteUrl: string;
+    if (input.sourceType === "local") {
+      try { remoteUrl = await gitRemoteUrl(await validateGitRepository(resolve(input.localPath))); }
+      catch (error) { throw badRequest(`Local repository is invalid: ${messageOf(error)}`); }
+    } else remoteUrl = input.remoteUrl;
 
-    if (input.sourceType === "existing") {
-      project = registered.find((item) => item.id === input.projectId) ?? null;
-      if (!project) throw badRequest("Project not found");
-    } else {
-      let remoteUrl: string;
-      if (input.sourceType === "local") {
-        try {
-          remoteUrl = await gitRemoteUrl(await validateGitRepository(resolve(input.localPath)));
-        } catch (error) {
-          throw badRequest(`Local repository is invalid: ${messageOf(error)}`);
-        }
-      } else remoteUrl = input.remoteUrl;
-      project = registered.find((item) => item.remoteUrl === remoteUrl) ?? null;
-      if (!project) {
-        const name = repositoryNameFromSource(remoteUrl);
-        if (registered.some((item) => item.name === name)) throw badRequest(`A different Project already uses the name "${name}"`);
-        let localPath: string;
-        let baseBranch: string;
-        try {
-          localPath = await cloneManagedRepository(remoteUrl, join(this.config.dataDirectory, "repositories", name));
-          baseBranch = await gitDefaultBranch(localPath);
-        } catch (error) {
-          throw badRequest(`Unable to clone Project: ${messageOf(error)}`);
-        }
-        const at = now();
-        project = this.db.insertManagedProject({ id: createId("project"), name, localPath, remoteUrl, baseBranch, createdAt: at, updatedAt: at });
-        this.emit({ type: "project.registered", taskId: null, sessionId: null, provider: null, payload: project });
+    const registered = this.db.listProjects();
+    let project = registered.find((item) => item.remoteUrl === remoteUrl) ?? null;
+    if (!project) {
+      const name = repositoryNameFromSource(remoteUrl);
+      if (registered.some((item) => item.name === name)) throw badRequest(`A different Project already uses the name "${name}"`);
+      let localPath: string;
+      let baseBranch: string;
+      try {
+        localPath = await cloneManagedRepository(remoteUrl, join(this.config.dataDirectory, "repositories", name));
+        baseBranch = await gitDefaultBranch(localPath);
+      } catch (error) {
+        throw badRequest(`Unable to clone Project: ${messageOf(error)}`);
       }
+      const at = now();
+      project = this.db.insertProject({ id: createId("project"), name, localPath, remoteUrl, baseBranch, createdAt: at, updatedAt: at });
+      this.emit({ type: "project.registered", taskId: null, sessionId: null, provider: null, payload: project });
     }
 
-    if (this.db.listWorkspaceHubProjects(workspace.id).some((item) => item.projectId === project.id)) {
+    if (this.db.listWorkspaceProjects(workspace.id).some((item) => item.projectId === project.id)) {
       throw badRequest(`${project.name} is already in this Workspace`);
     }
     let worktree: Awaited<ReturnType<typeof addWorkspaceWorktree>>;
@@ -243,7 +221,7 @@ export class AgentBoardRuntime {
     } catch (error) {
       throw badRequest(`Unable to create Project worktree: ${messageOf(error)}`);
     }
-    const link = this.db.insertWorkspaceHubProject({
+    const link = this.db.insertWorkspaceProject({
       id: createId("workspaceProject"), workspaceId: workspace.id, projectId: project.id,
       branch: worktree.taskBranch, worktreePath: worktree.worktreePath,
       baseBranch: worktree.baseBranch, createdAt: now(),
@@ -253,128 +231,34 @@ export class AgentBoardRuntime {
   }
 
   async createAgentTask(workspaceId: string, input: { title: string; provider: AgentProvider; executorType: "native" | "docker"; prompt: string; executionProfileId?: string; startImmediately?: boolean }): Promise<Record<string, unknown>> {
-    const workspace = this.db.getWorkspaceHub(workspaceId);
+    const workspace = this.db.getWorkspace(workspaceId);
     if (!workspace) throw badRequest("Workspace not found");
-    if (!this.db.listWorkspaceHubProjects(workspace.id).length) throw badRequest("Add at least one Project before creating a Task");
-    const task = this.createTask({ projectId: workspace.legacyProjectId, title: input.title, description: input.prompt });
+    if (!this.db.listWorkspaceProjects(workspace.id).length) throw badRequest("Add at least one Project before creating a Task");
     const at = now();
-    this.db.insertWorkspace({
-      id: createId("runtimeWorkspace"), taskId: task.id, rootPath: workspace.rootPath,
-      branchPrefix: workspace.branchPrefix, status: "ready", error: null, createdAt: at, updatedAt: at,
+    const task = this.db.insertTask({
+      id: createId("task"), workspaceId: workspace.id, title: input.title, description: input.prompt,
+      status: "todo", reviewRequired: false, createdAt: at, updatedAt: at, startedAt: null, completedAt: null, cancelledAt: null,
     });
+    this.emit({ type: "task.created", taskId: task.id, sessionId: null, provider: null, payload: task });
     if (input.startImmediately !== false) {
       await this.startSession(task.id, {
         provider: input.provider, executorType: input.executorType, prompt: input.prompt,
         ...(input.executionProfileId ? { executionProfileId: input.executionProfileId } : {}),
       });
     }
-    return { ...this.taskDetails(task.id), workspaceHub: workspace };
-  }
-
-  async createRepository(projectId: string, input: { name: string; localPath?: string | null; remoteUrl?: string | null; baseBranch: string }): Promise<Repository> {
-    if (!this.db.getProject(projectId)) throw new Error("Project not found");
-    if (Boolean(input.localPath) === Boolean(input.remoteUrl)) throw badRequest("Choose exactly one repository source: remote URL or local path");
-    const remoteUrl = input.localPath
-      ? await gitRemoteUrl(resolve(input.localPath))
-      : input.remoteUrl as string;
-    const cacheRoot = join(this.config.dataDirectory, "repositories", projectId);
-    const localPath = await cloneManagedRepository(remoteUrl, join(cacheRoot, safeDirectoryName(input.name)));
-    const at = now();
-    const repository = this.db.insertRepository({
-      id: createId("repo"), projectId, name: input.name, localPath,
-      remoteUrl, baseBranch: input.baseBranch, createdAt: at, updatedAt: at,
-    });
-    this.emit({ type: "repository.created", taskId: null, sessionId: null, provider: null, payload: repository });
-    return repository;
-  }
-
-  async addRepositoryToWorkspace(taskId: string, input: { sourceType: "remote"; remoteUrl: string } | { sourceType: "local"; localPath: string }): Promise<{ repository: Repository; workspaceRepository: WorkspaceRepository }> {
-    const task = this.db.getTask(taskId);
-    if (!task) throw badRequest("Task not found");
-    const workspace = this.db.getWorkspaceByTask(taskId);
-    if (!workspace || workspace.status !== "ready") throw badRequest("Create a ready Workspace before adding a Git project");
-
-    let remoteUrl: string;
-    if (input.sourceType === "local") {
-      try {
-        const sourcePath = await validateGitRepository(resolve(input.localPath));
-        remoteUrl = await gitRemoteUrl(sourcePath);
-      } catch (error) {
-        throw badRequest(`Local repository is invalid: ${messageOf(error)}`);
-      }
-    } else {
-      remoteUrl = input.remoteUrl;
-    }
-    const name = repositoryNameFromSource(remoteUrl);
-    const registered = this.db.listRepositories(task.projectId);
-    let repository = registered.find((item) => item.remoteUrl === remoteUrl) ?? null;
-
-    if (!repository) {
-      const conflictingName = registered.find((item) => item.name === name);
-      if (conflictingName) throw badRequest(`A different repository already uses the name "${name}" in this project`);
-      const cacheRoot = join(this.config.dataDirectory, "repositories", task.projectId);
-      let localPath: string;
-      let baseBranch: string;
-      try {
-        localPath = await cloneManagedRepository(remoteUrl, join(cacheRoot, name));
-        baseBranch = await gitDefaultBranch(localPath);
-      } catch (error) {
-        throw badRequest(`Unable to clone repository: ${messageOf(error)}`);
-      }
-      const at = now();
-      repository = this.db.insertRepository({
-        id: createId("repo"), projectId: task.projectId, name, localPath, remoteUrl,
-        baseBranch, createdAt: at, updatedAt: at,
-      });
-      this.emit({ type: "repository.created", taskId, sessionId: null, provider: null, payload: repository });
-    }
-
-    if (this.db.listWorkspaceRepositories(workspace.id).some((item) => item.repositoryId === repository.id)) {
-      throw badRequest(`${repository.name} is already linked to this Workspace`);
-    }
-    let worktree: Awaited<ReturnType<typeof addWorkspaceWorktree>>;
-    try {
-      worktree = await addWorkspaceWorktree(workspace.rootPath, {
-        repositoryId: repository.id,
-        repositoryName: repository.name,
-        repositoryPath: repository.localPath,
-        directoryName: repository.name,
-        baseBranch: repository.baseBranch,
-        taskBranch: workspace.branchPrefix,
-      }, true);
-    } catch (error) {
-      throw badRequest(`Unable to create Workspace worktree: ${messageOf(error)}`);
-    }
-    const workspaceRepository = this.db.insertWorkspaceRepository({
-      id: createId("workspaceRepo"), workspaceId: workspace.id, repositoryId: repository.id,
-      branch: worktree.taskBranch, worktreePath: worktree.worktreePath,
-      baseBranch: worktree.baseBranch, createdAt: now(),
-    });
-    this.emit({ type: "workspace.repository-added", taskId, sessionId: null, provider: null, payload: { repository, workspaceRepository } });
-    return { repository, workspaceRepository };
-  }
-
-  createTask(input: Pick<Task, "projectId" | "title" | "description">): Task {
-    if (!this.db.getProject(input.projectId)) throw new Error("Project not found");
-    const at = now();
-    const task = this.db.insertTask({
-      id: createId("task"), ...input, status: "todo", reviewRequired: false,
-      createdAt: at, updatedAt: at, startedAt: null, completedAt: null, cancelledAt: null,
-    });
-    this.emit({ type: "task.created", taskId: task.id, sessionId: null, provider: null, payload: task });
-    return task;
+    return { ...this.taskDetails(task.id), workspace };
   }
 
   taskDetails(taskId: string): Record<string, unknown> {
     const task = this.db.getTask(taskId);
     if (!task) throw new Error("Task not found");
-    const workspace = this.db.getWorkspaceByTask(taskId);
+    const workspace = this.db.getWorkspace(task.workspaceId);
     return {
       task,
       workspace,
-      workspaceHub: this.db.getWorkspaceHubByLegacyProject(task.projectId),
-      workspaceRepositories: workspace ? this.db.listWorkspaceRepositories(workspace.id) : [],
+      projects: workspace ? this.db.listWorkspaceProjects(workspace.id) : [],
       sessions: this.db.listSessions(taskId),
+      runs: this.db.listAgentRuns(taskId),
       attempts: this.db.listSessions(taskId).flatMap((session) => this.db.listAttempts(session.id)),
       messages: this.db.listMessages(taskId),
       interactions: this.db.listInteractions(taskId),
@@ -388,119 +272,25 @@ export class AgentBoardRuntime {
     return {
       task,
       sessions: this.db.listSessions(taskId),
+      runs: this.db.listAgentRuns(taskId),
       messages: this.db.listMessages(taskId),
       interactions: this.db.listInteractions(taskId),
       events: [],
     };
   }
 
-  async createTaskWorkspace(taskId: string, repositoryIds: string[], options: { rootPath?: string; branchName?: string; fetch?: boolean; knowledgeSources?: KnowledgeSourceInput[] }): Promise<Workspace> {
-    const task = this.db.getTask(taskId);
-    if (!task) throw new Error("Task not found");
-    const existingWorkspace = this.db.getWorkspaceByTask(taskId);
-    if (existingWorkspace && existingWorkspace.status !== "failed") throw new Error("Task already has a Workspace");
-    const repositories = this.db.getRepositories(repositoryIds);
-    if (repositories.length !== repositoryIds.length) throw new Error("One or more repositories were not found");
-    if (repositories.some((repository) => repository.projectId !== task.projectId)) throw new Error("All repositories must belong to the task project");
-    const at = now();
-    // A retry must reuse the paths already recorded for the Workspace. Allowing new
-    // values here would make the database point at a different directory/branch.
-    const root = existingWorkspace
-      ? resolve(existingWorkspace.rootPath, "..")
-      : options.rootPath ? expandHome(options.rootPath) : this.config.workspaceRoot;
-    const branch = existingWorkspace?.branchPrefix ?? options.branchName ?? `agent/${task.id}`;
-    const workspace: Workspace = existingWorkspace
-      ? { ...existingWorkspace, status: "creating", error: null, updatedAt: at }
-      : {
-          id: createId("workspace"), taskId, rootPath: resolveWorkspacePath(root, task.id), branchPrefix: branch,
-          status: "creating", error: null, createdAt: at, updatedAt: at,
-        };
-    if (existingWorkspace) this.db.updateWorkspace(workspace.id, "creating", null, at);
-    else this.db.insertWorkspace(workspace);
-    this.emit({ type: "workspace.creating", taskId, sessionId: null, provider: null, payload: workspace });
-    let created: Awaited<ReturnType<typeof createWorkspace>> | null = null;
-    try {
-      created = await createWorkspace({
-        taskId: task.id,
-        rootPath: root,
-        fetch: options.fetch ?? false,
-        repositories: repositories.map((repository) => ({
-          repositoryId: repository.id,
-          repositoryName: repository.name,
-          repositoryPath: repository.localPath,
-          directoryName: repository.name,
-          baseBranch: repository.baseBranch,
-          taskBranch: branch,
-        })),
-      });
-      for (const worktree of created.worktrees) {
-        const row: WorkspaceRepository = {
-          id: createId("workspaceRepo"), workspaceId: workspace.id, repositoryId: worktree.repositoryId,
-          branch: worktree.taskBranch, worktreePath: worktree.worktreePath, baseBranch: worktree.baseBranch, createdAt: now(),
-        };
-        this.db.insertWorkspaceRepository(row);
-      }
-      if (options.knowledgeSources?.length) await writeCompiledContexts(created.workspacePath, options.knowledgeSources);
-      this.db.updateWorkspace(workspace.id, "ready", null, now());
-      this.emit({ type: "workspace.ready", taskId, sessionId: null, provider: null, payload: { ...workspace, status: "ready" } });
-      return this.db.getWorkspaceByTask(taskId) as Workspace;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (created) {
-        try {
-          await removeWorkspaceWorktrees(created.worktrees.map((item) => ({
-            repositoryPath: item.repositoryPath,
-            worktreePath: item.worktreePath,
-          })), true);
-        } catch { /* keep the original error and leave paths visible for recovery */ }
-      }
-      this.db.deleteWorkspaceRepositories(workspace.id);
-      this.db.updateWorkspace(workspace.id, "failed", message, now());
-      this.emit({ type: "workspace.failed", taskId, sessionId: null, provider: null, payload: { error: message } });
-      throw error;
-    }
-  }
-
   async taskChanges(taskId: string): Promise<unknown[]> {
     const task = this.db.getTask(taskId);
     if (!task) throw new Error("Task not found");
-    const hub = this.db.getWorkspaceHubByLegacyProject(task.projectId);
-    if (hub) {
-      const links = this.db.listWorkspaceHubProjects(hub.id);
-      const projects = this.db.getManagedProjects(links.map((item) => item.projectId));
-      const byId = new Map(projects.map((project) => [project.id, project]));
-      return inspectChanges(links.map((item) => ({
-        repositoryId: item.projectId, repositoryName: byId.get(item.projectId)?.name ?? item.projectId,
-        worktreePath: item.worktreePath, baseBranch: item.baseBranch,
-      })));
-    }
-    const workspace = this.db.getWorkspaceByTask(taskId);
-    if (!workspace) throw new Error("Workspace not found");
-    const worktrees = this.db.listWorkspaceRepositories(workspace.id);
-    const repositories = this.db.getRepositories(worktrees.map((item) => item.repositoryId));
-    const byId = new Map(repositories.map((repository) => [repository.id, repository]));
-    return inspectChanges(worktrees.map((item) => ({
-      repositoryId: item.repositoryId,
-      repositoryName: byId.get(item.repositoryId)?.name ?? item.repositoryId,
+    const projects = this.db.listWorkspaceProjects(task.workspaceId);
+    const projectRows = this.db.getProjects(projects.map((item) => item.projectId));
+    const byId = new Map(projectRows.map((project) => [project.id, project]));
+    return inspectChanges(projects.map((item) => ({
+      repositoryId: item.projectId,
+      repositoryName: byId.get(item.projectId)?.name ?? item.projectId,
       worktreePath: item.worktreePath,
       baseBranch: item.baseBranch,
     })));
-  }
-
-  async cleanupWorkspace(taskId: string, force = false): Promise<Workspace> {
-    const workspace = this.db.getWorkspaceByTask(taskId);
-    if (!workspace) throw new Error("Workspace not found");
-    const links = this.db.listWorkspaceRepositories(workspace.id);
-    const repositories = this.db.getRepositories(links.map((item) => item.repositoryId));
-    const byId = new Map(repositories.map((repository) => [repository.id, repository]));
-    await removeWorkspaceWorktrees(links.map((link) => {
-      const repository = byId.get(link.repositoryId);
-      if (!repository) throw new Error(`Repository not found: ${link.repositoryId}`);
-      return { repositoryPath: repository.localPath, worktreePath: link.worktreePath };
-    }), force);
-    this.db.updateWorkspace(workspace.id, "archived", null, now());
-    this.emit({ type: "workspace.archived", taskId, sessionId: null, provider: null, payload: { workspaceId: workspace.id } });
-    return this.db.getWorkspaceByTask(taskId) as Workspace;
   }
 
   async saveKnowledgeCandidate(taskId: string, title: string, content: string): Promise<{ path: string }> {
@@ -536,14 +326,14 @@ export class AgentBoardRuntime {
 
   async startSession(taskId: string, input: { provider: AgentProvider; executorType: "native" | "docker"; executionProfileId?: string; prompt: string; image?: string }): Promise<AgentSession> {
     const task = this.db.getTask(taskId);
-    const workspace = this.db.getWorkspaceByTask(taskId);
     if (!task) throw new Error("Task not found");
+    const workspace = this.db.getWorkspace(task.workspaceId);
     if (!workspace || workspace.status !== "ready") throw new Error("A ready Workspace is required");
     const profile = input.executionProfileId ? this.db.getExecutionProfile(input.executionProfileId) : null;
     if (profile && (profile.provider !== input.provider || profile.type !== input.executorType)) throw new Error("Execution Profile does not match provider/executor");
     const at = now();
     const session: AgentSession = {
-      id: createId("session"), taskId, workspaceId: workspace.id, provider: input.provider,
+      id: createId("session"), taskId, provider: input.provider,
       executorType: input.executorType, executionProfileId: profile?.id ?? null,
       providerSessionId: null, providerTurnId: null, runtimeStatus: "starting", prompt: input.prompt,
       summary: null, error: null, createdAt: at, updatedAt: at, endedAt: null,
@@ -608,6 +398,47 @@ export class AgentBoardRuntime {
         throw new Error(`Unable to send message: ${detail}`);
       }
     });
+  }
+
+  /**
+   * The AG-UI boundary uses a Task as the durable Thread. This method is the
+   * only place where a protocol Run is mapped to the current provider Session.
+   */
+  async runTaskMessage(taskId: string, runId: string, content: string): Promise<AgentRun> {
+    const task = this.db.getTask(taskId);
+    if (!task) throw new Error("Task not found");
+    const session = this.db.listSessions(taskId).at(-1);
+    if (!session) throw badRequest("Task has no Agent session");
+    const existing = this.db.getAgentRun(runId);
+    if (existing) return existing;
+    const startedAt = now();
+    const run: AgentRun = {
+      id: runId, taskId, sessionId: session.id, status: "running", startedAt, endedAt: null, error: null,
+    };
+    this.db.insertAgentRun(run);
+    this.emit({
+      type: "RUN_STARTED", taskId, sessionId: session.id, provider: session.provider,
+      payload: { type: "RUN_STARTED", threadId: taskId, runId, timestamp: Date.now() },
+    });
+    try {
+      await this.sendMessage(session.id, content, `run:${runId}`);
+      return run;
+    } catch (error) {
+      const message = messageOf(error);
+      this.db.updateAgentRun(run.id, { status: "failed", endedAt: now(), error: message });
+      this.emit({
+        type: "RUN_ERROR", taskId, sessionId: session.id, provider: session.provider,
+        payload: { type: "RUN_ERROR", threadId: taskId, runId, message, timestamp: Date.now() },
+      });
+      throw error;
+    }
+  }
+
+  completeAgentRun(runId: string, status: AgentRun["status"], error: string | null = null): AgentRun | null {
+    const run = this.db.getAgentRun(runId);
+    if (!run || run.status !== "running") return run;
+    this.db.updateAgentRun(runId, { status, endedAt: now(), error });
+    return this.db.getAgentRun(runId);
   }
 
   async interruptSession(sessionId: string): Promise<void> {
@@ -708,6 +539,23 @@ export class AgentBoardRuntime {
     return this.db.getTask(taskId) as Task;
   }
 
+  async archiveTask(taskId: string): Promise<Task> {
+    const task = this.db.getTask(taskId);
+    if (!task) throw new Error("Task not found");
+    await this.#stopTaskSessions(taskId, "Task was archived");
+    this.db.setTaskStatus(taskId, "archived", now());
+    this.emit({ type: "task.archived", taskId, sessionId: null, provider: null, payload: {} });
+    return this.db.getTask(taskId) as Task;
+  }
+
+  async deleteTask(taskId: string): Promise<{ deleted: true }> {
+    const task = this.db.getTask(taskId);
+    if (!task) throw new Error("Task not found");
+    await this.#stopTaskSessions(taskId, "Task was deleted");
+    this.db.deleteTask(taskId);
+    return { deleted: true };
+  }
+
   async cancelTask(taskId: string): Promise<Task> {
     if (!this.db.getTask(taskId)) throw new Error("Task not found");
     for (const session of this.db.listSessions(taskId)) {
@@ -723,6 +571,23 @@ export class AgentBoardRuntime {
     this.db.setTaskStatus(taskId, "cancelled", now());
     this.emit({ type: "task.cancelled", taskId, sessionId: null, provider: null, payload: {} });
     return this.db.getTask(taskId) as Task;
+  }
+
+  async #stopTaskSessions(taskId: string, reason: string): Promise<void> {
+    for (const session of this.db.listSessions(taskId)) {
+      if (this.#adapters[session.provider].isRunning(session.id)) {
+        try { await this.#adapters[session.provider].terminate(session.id); } catch { /* process may already have exited */ }
+      }
+      this.#rejectSessionInteractions(session.id, new Error(reason));
+      this.db.staleSessionInteractions(session.id, now());
+      if (session.runtimeStatus === "starting" || session.runtimeStatus === "running" || session.runtimeStatus === "waiting" || session.runtimeStatus === "suspended") {
+        this.db.updateSession(session.id, { runtimeStatus: "stopped", endedAt: now() }, now());
+      }
+      const attempt = this.db.latestAttempt(session.id);
+      if (attempt && !["completed", "failed", "interrupted", "stopped"].includes(attempt.status)) {
+        this.db.updateAttempt(attempt.id, { status: "stopped", endedAt: now() }, now());
+      }
+    }
   }
 
   async health(): Promise<Record<string, unknown>> {
@@ -790,7 +655,7 @@ export class AgentBoardRuntime {
     if (!event.sessionId) return;
     const session = this.db.getSession(event.sessionId);
     if (!session) return;
-    if (event.type === "session.started" || event.type === "session.initialized" || event.type === "RUN_STARTED") {
+    if (event.type === "session.started" || event.type === "RUN_STARTED") {
       const payload = event.payload as Record<string, unknown>;
       this.db.updateSession(session.id, {
         runtimeStatus: "running",
@@ -810,16 +675,15 @@ export class AgentBoardRuntime {
         this.db.setTaskStatus(session.taskId, "needs_attention", now());
         this.#notify("Agents-Workspaces Task failed", this.db.getTask(session.taskId)?.title ?? session.taskId);
       }
-    } else if (event.type === "turn.completed" || event.type === "RUN_FINISHED") {
+    } else if (event.type === "RUN_FINISHED") {
       const payload = event.payload as Record<string, unknown>;
-      const turn = payload.turn && typeof payload.turn === "object" ? payload.turn as Record<string, unknown> : {};
-      const failed = turn.status === "failed" || payload.is_error === true;
+      const failed = payload.is_error === true;
       this.db.updateSession(session.id, failed
-        ? { runtimeStatus: "failed", error: JSON.stringify(turn.error ?? payload.error ?? payload) }
+        ? { runtimeStatus: "failed", error: JSON.stringify(payload.error ?? payload) }
         : { runtimeStatus: "stopped", summary: typeof payload.result === "string" ? payload.result : session.summary }, now());
       const attempt = this.db.latestAttempt(session.id);
       if (attempt) this.db.updateAttempt(attempt.id, failed
-        ? { status: "failed", error: JSON.stringify(turn.error ?? payload.error ?? payload), endedAt: now() }
+        ? { status: "failed", error: JSON.stringify(payload.error ?? payload), endedAt: now() }
         : { status: "idle", error: null }, now());
       this.db.staleSessionInteractions(session.id, now());
       this.#recomputeTaskStatus(session.taskId);
@@ -844,6 +708,7 @@ export class AgentBoardRuntime {
   #recomputeTaskStatus(taskId: string): void {
     const task = this.db.getTask(taskId);
     if (!task) return;
+    if (task.status === "archived") return;
     const status = deriveTaskStatus({
       hasStarted: task.startedAt !== null,
       reviewRequired: task.reviewRequired,
@@ -865,11 +730,9 @@ export class AgentBoardRuntime {
     for (const event of this.db.listEvents(undefined, 0, 100_000)) {
       if (!event.taskId || !event.sessionId) continue;
       const payload = event.payload as Record<string, unknown>;
-      const turn = payload.turn && typeof payload.turn === "object" ? payload.turn as Record<string, unknown> : {};
-      if ((event.type === "RUN_ERROR") || (event.type === "session.error" && payload.willRetry !== true) || (event.type === "turn.completed" && (turn.status === "failed" || payload.is_error === true))) {
-        failed.set(event.taskId, { sessionId: event.sessionId, error: JSON.stringify(payload.error ?? turn.error ?? payload) });
-      } else if (event.type === "turn.completed" || event.type === "RUN_FINISHED" ||
-        event.type === "session.started" || event.type === "RUN_STARTED" || event.type === "turn.started") {
+      if ((event.type === "RUN_ERROR") || (event.type === "session.error" && payload.willRetry !== true)) {
+        failed.set(event.taskId, { sessionId: event.sessionId, error: JSON.stringify(payload.error ?? payload) });
+      } else if (event.type === "RUN_FINISHED" || event.type === "session.started" || event.type === "RUN_STARTED") {
         failed.delete(event.taskId);
       }
     }
@@ -888,7 +751,8 @@ export class AgentBoardRuntime {
   }
 
   async #startAdapter(session: AgentSession, prompt: string, profile: ExecutionProfile | null, image?: string): Promise<void> {
-    const workspace = this.db.getWorkspaceByTask(session.taskId);
+    const task = this.db.getTask(session.taskId);
+    const workspace = task ? this.db.getWorkspace(task.workspaceId) : null;
     if (!workspace || workspace.status !== "ready") throw new Error("A ready Workspace is required to resume this session");
     const at = now();
     const attempt: SessionAttempt = {

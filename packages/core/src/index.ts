@@ -8,8 +8,8 @@ export type TaskStatus =
   | "needs_attention"
   | "in_review"
   | "done"
-  | "cancelled";
-export type WorkspaceStatus = "creating" | "ready" | "failed" | "archived";
+  | "cancelled"
+  | "archived";
 export type SessionRuntimeStatus = "starting" | "running" | "waiting" | "suspended" | "stopped" | "failed";
 export type SessionAttemptStatus = "starting" | "running" | "waiting" | "idle" | "completed" | "failed" | "interrupted" | "stopped";
 export type ConversationMessageStatus = "queued" | "submitting" | "accepted" | "failed";
@@ -22,17 +22,9 @@ export type InteractionKind =
   | "choice"
   | "form";
 
-export interface Project {
+/** A durable multi-repository work area. */
+export interface Workspace {
   id: string;
-  name: string;
-  description: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface WorkspaceHub {
-  id: string;
-  legacyProjectId: string;
   name: string;
   rootPath: string;
   branchPrefix: string;
@@ -41,7 +33,8 @@ export interface WorkspaceHub {
   updatedAt: string;
 }
 
-export interface ManagedProject {
+/** A managed Git clone that can be mounted into a Workspace as a worktree. */
+export interface Project {
   id: string;
   name: string;
   localPath: string;
@@ -51,7 +44,7 @@ export interface ManagedProject {
   updatedAt: string;
 }
 
-export interface WorkspaceHubProject {
+export interface WorkspaceProject {
   id: string;
   workspaceId: string;
   projectId: string;
@@ -61,20 +54,9 @@ export interface WorkspaceHubProject {
   createdAt: string;
 }
 
-export interface Repository {
-  id: string;
-  projectId: string;
-  name: string;
-  localPath: string;
-  remoteUrl: string | null;
-  baseBranch: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
 export interface Task {
   id: string;
-  projectId: string;
+  workspaceId: string;
   title: string;
   description: string;
   status: TaskStatus;
@@ -84,27 +66,6 @@ export interface Task {
   startedAt: string | null;
   completedAt: string | null;
   cancelledAt: string | null;
-}
-
-export interface Workspace {
-  id: string;
-  taskId: string;
-  rootPath: string;
-  branchPrefix: string;
-  status: WorkspaceStatus;
-  error: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface WorkspaceRepository {
-  id: string;
-  workspaceId: string;
-  repositoryId: string;
-  branch: string;
-  worktreePath: string;
-  baseBranch: string;
-  createdAt: string;
 }
 
 export interface ExecutionProfile {
@@ -121,7 +82,6 @@ export interface ExecutionProfile {
 export interface AgentSession {
   id: string;
   taskId: string;
-  workspaceId: string;
   provider: AgentProvider;
   executorType: ExecutorType;
   executionProfileId: string | null;
@@ -134,6 +94,21 @@ export interface AgentSession {
   createdAt: string;
   updatedAt: string;
   endedAt: string | null;
+}
+
+/**
+ * A user-visible execution of an Agent Thread. A Task is the durable Thread;
+ * Provider sessions are implementation details that can be restarted or
+ * resumed without changing the Thread identity.
+ */
+export interface AgentRun {
+  id: string;
+  taskId: string;
+  sessionId: string;
+  status: "running" | "completed" | "failed" | "cancelled";
+  startedAt: string;
+  endedAt: string | null;
+  error: string | null;
 }
 
 export interface SessionAttempt {
